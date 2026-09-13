@@ -9,19 +9,12 @@ from datetime import datetime, timezone
 
 
 # ============================================================
-# SLK BIAS TRADING BOT
+# SLK BIAS BOT
 #
-# WEEKLY PATH:
-# W1 BRS -> W1 KEY-LEVEL REJECTION -> D1 EXTERNAL BO
-#
-# DAILY PATH:
-# D1 BRS -> D1 KEY-LEVEL REJECTION -> H4 EXTERNAL BO
+# W1 -> D1 EXTERNAL BO
+# D1 -> H4 EXTERNAL BO
 #
 # BIAS ONLY
-# NO ENTRY
-# NO SL
-# NO TP
-# NO TRADE EXECUTION
 # ============================================================
 
 
@@ -41,8 +34,9 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID", ""
 ).strip()
 
+# 4 hours
 SCAN_INTERVAL = int(
-    os.getenv("SCAN_INTERVAL", "900")
+    os.getenv("SCAN_INTERVAL", "14400")
 )
 
 PORT = int(
@@ -55,66 +49,22 @@ PORT = int(
 # ============================================================
 
 INSTRUMENTS = {
-    "EURUSD": ["EUR/USD"],
-    "GBPUSD": ["GBP/USD"],
-    "USDJPY": ["USD/JPY"],
-    "USDCHF": ["USD/CHF"],
-    "AUDUSD": ["AUD/USD"],
-    "USDCAD": ["USD/CAD"],
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "USDCHF": "USD/CHF",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
 
-    "EURGBP": ["EUR/GBP"],
-    "EURJPY": ["EUR/JPY"],
-    "GBPJPY": ["GBP/JPY"],
-    "AUDJPY": ["AUD/JPY"],
-
-    "JP225": [
-        "JP225",
-        "NIKKEI",
-        "NI225"
-    ],
-
-    "UK100": [
-        "UK100",
-        "FTSE"
-    ],
-
-    "NAS100": [
-        "NAS100",
-        "NDX"
-    ],
-
-    "XAUUSD": [
-        "XAU/USD",
-        "XAUUSD"
-    ],
-}
-
-
-DISPLAY_NAMES = {
-    "EUR/USD": "EURUSD",
-    "GBP/USD": "GBPUSD",
-    "USD/JPY": "USDJPY",
-    "USD/CHF": "USDCHF",
-    "AUD/USD": "AUDUSD",
-    "USD/CAD": "USDCAD",
-
-    "EUR/GBP": "EURGBP",
-    "EUR/JPY": "EURJPY",
-    "GBP/JPY": "GBPJPY",
-    "AUD/JPY": "AUDJPY",
+    "EURGBP": "EUR/GBP",
+    "EURJPY": "EUR/JPY",
+    "GBPJPY": "GBP/JPY",
+    "AUDJPY": "AUD/JPY",
 
     "JP225": "JP225",
-    "NIKKEI": "JP225",
-    "NI225": "JP225",
-
     "UK100": "UK100",
-    "FTSE": "UK100",
-
     "NAS100": "NAS100",
-    "NDX": "NAS100",
-
-    "XAU/USD": "XAUUSD",
-    "XAUUSD": "XAUUSD",
+    "XAUUSD": "XAU/USD",
 }
 
 
@@ -122,19 +72,10 @@ DISPLAY_NAMES = {
 # SETTINGS
 # ============================================================
 
-PIVOT_STRENGTH = int(
-    os.getenv("PIVOT_STRENGTH", "2")
-)
-
+PIVOT_STRENGTH = 2
 MIN_BARS = 40
-
-KEY_LOOKBACK = int(
-    os.getenv("KEY_LOOKBACK", "100")
-)
-
-LEVEL_TOLERANCE = float(
-    os.getenv("LEVEL_TOLERANCE", "0.0025")
-)
+KEY_LOOKBACK = 100
+LEVEL_TOLERANCE = 0.0025
 
 
 # ============================================================
@@ -142,14 +83,24 @@ LEVEL_TOLERANCE = float(
 # ============================================================
 
 cache = {}
-
-resolved_symbols = {}
-
 sent_signals = {}
 
 state_lock = Lock()
 
 last_scan_time = None
+
+# ------------------------------------------------------------
+# API RATE LIMIT
+#
+# Free plan = 8 credits/minute.
+# We deliberately stay below that.
+# ------------------------------------------------------------
+
+api_lock = Lock()
+
+last_api_call = 0
+
+API_DELAY = 9.0
 
 
 # ============================================================
@@ -160,16 +111,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        response = {
+        body = json.dumps({
             "status": "ok",
             "bot": "SLK Bias Trading Bot",
-            "instruments": 14,
+            "instruments": len(INSTRUMENTS),
             "last_scan": last_scan_time
-        }
-
-        body = json.dumps(
-            response
-        ).encode("utf-8")
+        }).encode("utf-8")
 
         self.send_response(200)
 
@@ -248,20 +195,52 @@ def remove_current_candle(candles):
     if len(candles) <= 2:
         return candles
 
-    # Twelve Data can return the currently forming candle.
-    # We only use completed candles.
     return candles[:-1]
 
 
 # ============================================================
-# TWELVE DATA
+# TWELVE DATA API
 # ============================================================
 
 def api_get(endpoint, params):
 
+    global last_api_call
+
+    # --------------------------------------------------------
+    # RATE LIMITER
+    # Maximum approximately 6-7 requests/minute.
+    # --------------------------------------------------------
+
+    with api_lock:
+
+        now = time.time()
+
+        wait_time = (
+            API_DELAY
+            - (now - last_api_call)
+        )
+
+        if wait_time > 0:
+
+            print(
+                f"API limiter: waiting "
+                f"{wait_time:.1f}s"
+            )
+
+            time.sleep(
+                wait_time
+            )
+
+        last_api_call = time.time()
+
     params = dict(params)
 
-    params["apikey"] = TWELVE_DATA_API_KEY
+    params["apikey"] = (
+        TWELVE_DATA_API_KEY
+    )
+
+    # Explicit UTC timestamps.
+    params["timezone"] = "UTC"
 
     url = (
         "https://api.twelvedata.com"
@@ -300,6 +279,10 @@ def api_get(endpoint, params):
         return None
 
 
+# ============================================================
+# CANDLE DATA
+# ============================================================
+
 def get_candles(
     symbol,
     interval,
@@ -317,11 +300,13 @@ def get_candles(
 
         cached_time, candles = cached
 
+        # Do not repeatedly request unchanged data.
         if (
             time.time()
             - cached_time
-            < 60
+            < 300
         ):
+
             return candles
 
     result = api_get(
@@ -377,13 +362,14 @@ def get_candles(
             "close":
                 safe_float(
                     item.get("close")
-                ),
+                )
         }
 
         if (
             candle["datetime"]
             and candle["close"] is not None
         ):
+
             candles.append(candle)
 
     candles = sort_candles(
@@ -399,46 +385,7 @@ def get_candles(
 
 
 # ============================================================
-# SYMBOL RESOLUTION
-# ============================================================
-
-def resolve_symbol(name):
-
-    if name in resolved_symbols:
-
-        return resolved_symbols[name]
-
-    candidates = INSTRUMENTS[name]
-
-    for candidate in candidates:
-
-        test = get_candles(
-            candidate,
-            "1day",
-            5
-        )
-
-        if test:
-
-            resolved_symbols[
-                name
-            ] = candidate
-
-            print(
-                f"{name} -> {candidate}"
-            )
-
-            return candidate
-
-    print(
-        f"Could not resolve {name}"
-    )
-
-    return None
-
-
-# ============================================================
-# LINE-CHART PIVOTS
+# LINE-CHART STRUCTURE
 # ============================================================
 
 def is_pivot_high(
@@ -504,14 +451,10 @@ def get_pivots(candles):
     highs = []
     lows = []
 
-    end = (
-        len(candles)
-        - PIVOT_STRENGTH
-    )
-
     for i in range(
         PIVOT_STRENGTH,
-        end
+        len(candles)
+        - PIVOT_STRENGTH
     ):
 
         if is_pivot_high(
@@ -544,7 +487,7 @@ def get_pivots(candles):
 
 
 # ============================================================
-# HIGHER-TIMEFRAME BRS
+# BRS
 # ============================================================
 
 def find_latest_brs(candles):
@@ -554,11 +497,6 @@ def find_latest_brs(candles):
     )
 
     events = []
-
-    # --------------------------------------------------------
-    # BULLISH BRS
-    # Latest confirmed pivot HIGH broken by a close above it.
-    # --------------------------------------------------------
 
     for pivot in highs:
 
@@ -586,11 +524,6 @@ def find_latest_brs(candles):
                 })
 
                 break
-
-    # --------------------------------------------------------
-    # BEARISH BRS
-    # Latest confirmed pivot LOW broken by a close below it.
-    # --------------------------------------------------------
 
     for pivot in lows:
 
@@ -630,7 +563,7 @@ def find_latest_brs(candles):
 
 
 # ============================================================
-# KEY LEVEL HELPERS
+# KEY LEVELS
 # ============================================================
 
 def near_level(
@@ -638,7 +571,7 @@ def near_level(
     level
 ):
 
-    if price == 0:
+    if not price:
         return False
 
     return (
@@ -647,10 +580,6 @@ def near_level(
         <= LEVEL_TOLERANCE
     )
 
-
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
 
 def find_support_resistance(
     candles
@@ -685,10 +614,6 @@ def find_support_resistance(
     return levels
 
 
-# ============================================================
-# OCL
-# ============================================================
-
 def find_ocl(candles):
 
     levels = []
@@ -704,69 +629,35 @@ def find_ocl(candles):
         len(candles)
     ):
 
-        previous = candles[i - 1]
-        current = candles[i]
+        a = candles[i - 1]
+        b = candles[i]
 
-        previous_bull = (
-            previous["close"]
-            > previous["open"]
+        bullish = (
+            a["close"] > a["open"]
+            and b["close"] > b["open"]
         )
 
-        current_bull = (
-            current["close"]
-            > current["open"]
+        bearish = (
+            a["close"] < a["open"]
+            and b["close"] < b["open"]
         )
 
-        previous_bear = (
-            previous["close"]
-            < previous["open"]
-        )
-
-        current_bear = (
-            current["close"]
-            < current["open"]
-        )
-
-        if (
-            previous_bull
-            and current_bull
-        ):
+        if bullish or bearish:
 
             level = (
-                previous["open"]
-                + previous["close"]
+                a["open"]
+                + a["close"]
             ) / 2
 
             levels.append({
                 "type": "OCL",
                 "level": level,
                 "time":
-                    previous["datetime"]
-            })
-
-        elif (
-            previous_bear
-            and current_bear
-        ):
-
-            level = (
-                previous["open"]
-                + previous["close"]
-            ) / 2
-
-            levels.append({
-                "type": "OCL",
-                "level": level,
-                "time":
-                    previous["datetime"]
+                    a["datetime"]
             })
 
     return levels
 
-
-# ============================================================
-# RBS / SBR
-# ============================================================
 
 def find_rbs_sbr(candles):
 
@@ -776,14 +667,12 @@ def find_rbs_sbr(candles):
 
     levels = []
 
-    # ---------------- RBS ----------------
-
+    # RBS
     for pivot in highs[-12:]:
 
         level = pivot["price"]
 
-        broken = False
-        break_index = None
+        broken_at = None
 
         for i in range(
             pivot["index"] + 1,
@@ -795,42 +684,37 @@ def find_rbs_sbr(candles):
                 > level
             ):
 
-                broken = True
-                break_index = i
+                broken_at = i
                 break
 
-        if not broken:
+        if broken_at is None:
             continue
 
         for i in range(
-            break_index + 1,
+            broken_at + 1,
             len(candles)
         ):
 
-            candle = candles[i]
-
             if (
-                candle["low"] <= level
-                and candle["close"] > level
+                candles[i]["low"] <= level
+                and candles[i]["close"] > level
             ):
 
                 levels.append({
                     "type": "RBS",
                     "level": level,
                     "time":
-                        candle["datetime"]
+                        candles[i]["datetime"]
                 })
 
                 break
 
-    # ---------------- SBR ----------------
-
+    # SBR
     for pivot in lows[-12:]:
 
         level = pivot["price"]
 
-        broken = False
-        break_index = None
+        broken_at = None
 
         for i in range(
             pivot["index"] + 1,
@@ -842,30 +726,27 @@ def find_rbs_sbr(candles):
                 < level
             ):
 
-                broken = True
-                break_index = i
+                broken_at = i
                 break
 
-        if not broken:
+        if broken_at is None:
             continue
 
         for i in range(
-            break_index + 1,
+            broken_at + 1,
             len(candles)
         ):
 
-            candle = candles[i]
-
             if (
-                candle["high"] >= level
-                and candle["close"] < level
+                candles[i]["high"] >= level
+                and candles[i]["close"] < level
             ):
 
                 levels.append({
                     "type": "SBR",
                     "level": level,
                     "time":
-                        candle["datetime"]
+                        candles[i]["datetime"]
                 })
 
                 break
@@ -885,17 +766,7 @@ def find_qmr(candles):
 
     levels = []
 
-    # --------------------------------------------------------
-    # BEARISH QMR
-    #
-    # Left Shoulder High
-    # -> Head Higher High
-    # -> break of intervening low
-    # -> Right Shoulder Lower High
-    #
-    # QMR LEVEL = LEFT SHOULDER HIGH
-    # --------------------------------------------------------
-
+    # Bearish QMR
     for i in range(
         len(highs) - 2
     ):
@@ -917,7 +788,7 @@ def find_qmr(candles):
         ):
             continue
 
-        middle_lows = [
+        between = [
             x for x in lows
             if (
                 left["index"]
@@ -926,10 +797,10 @@ def find_qmr(candles):
             )
         ]
 
-        if not middle_lows:
+        if not between:
             continue
 
-        neckline = middle_lows[-1]
+        neckline = between[-1]
 
         broken = False
 
@@ -964,17 +835,7 @@ def find_qmr(candles):
             "direction": "SELL"
         })
 
-    # --------------------------------------------------------
-    # BULLISH QMR
-    #
-    # Left Shoulder Low
-    # -> Head Lower Low
-    # -> break of intervening high
-    # -> Right Shoulder Higher Low
-    #
-    # QMR LEVEL = LEFT SHOULDER LOW
-    # --------------------------------------------------------
-
+    # Bullish QMR
     for i in range(
         len(lows) - 2
     ):
@@ -996,7 +857,7 @@ def find_qmr(candles):
         ):
             continue
 
-        middle_highs = [
+        between = [
             x for x in highs
             if (
                 left["index"]
@@ -1005,10 +866,10 @@ def find_qmr(candles):
             )
         ]
 
-        if not middle_highs:
+        if not between:
             continue
 
-        neckline = middle_highs[-1]
+        neckline = between[-1]
 
         broken = False
 
@@ -1045,10 +906,6 @@ def find_qmr(candles):
 
     return levels
 
-
-# ============================================================
-# ALL KEY LEVELS
-# ============================================================
 
 def get_key_levels(candles):
 
@@ -1091,20 +948,17 @@ def is_rejection(
     direction
 ):
 
-    high = candle["high"]
-    low = candle["low"]
-    close = candle["close"]
-
-    if (
-        high is None
-        or low is None
-        or close is None
+    if not (
+        candle["high"]
+        and candle["low"]
+        and candle["close"]
     ):
         return False
 
     touched = (
-        low <= level <= high
-        or near_level(close, level)
+        candle["low"]
+        <= level
+        <= candle["high"]
     )
 
     if not touched:
@@ -1112,15 +966,17 @@ def is_rejection(
 
     if direction == "BUY":
 
-        # Bullish rejection:
-        # price reaches level and closes above it.
-        return close > level
+        return (
+            candle["close"]
+            > level
+        )
 
     if direction == "SELL":
 
-        # Bearish rejection:
-        # price reaches level and closes below it.
-        return close < level
+        return (
+            candle["close"]
+            < level
+        )
 
     return False
 
@@ -1137,15 +993,14 @@ def find_htf_rejection(
 
     for level_data in levels:
 
-        level_type = level_data[
-            "type"
-        ]
-
         level = level_data[
             "level"
         ]
 
-        # QMR direction must agree.
+        level_type = level_data[
+            "type"
+        ]
+
         if (
             level_type == "QMR"
             and level_data.get(
@@ -1159,10 +1014,8 @@ def find_htf_rejection(
             len(candles)
         ):
 
-            candle = candles[i]
-
             if is_rejection(
-                candle,
+                candles[i],
                 level,
                 direction
             ):
@@ -1184,10 +1037,10 @@ def find_htf_rejection(
                         i,
 
                     "rejection_time":
-                        candle["datetime"],
+                        candles[i]["datetime"],
 
                     "close":
-                        candle["close"]
+                        candles[i]["close"]
                 })
 
     if not candidates:
@@ -1215,95 +1068,79 @@ def find_external_bo(
         candles
     )
 
-    # --------------------------------------------------------
-    # ONLY STRUCTURE AFTER HTF REJECTION
-    # --------------------------------------------------------
-
     if direction == "BUY":
 
-        external_candidates = [
+        candidates = [
             p for p in highs
             if p["time"] > rejection_time
         ]
 
-        if not external_candidates:
+        if not candidates:
             return None
 
-        # Most recent external high.
-        external = external_candidates[-1]
+        external = candidates[-1]
 
         for i in range(
             external["index"] + 1,
             len(candles)
         ):
 
-            candle = candles[i]
-
-            # External BO requires a CLOSE above the high.
             if (
-                candle["close"]
+                candles[i]["close"]
                 > external["price"]
             ):
 
                 return {
                     "direction": "BUY",
-                    "type":
-                        "External BO",
                     "level":
                         external["price"],
                     "pivot_time":
                         external["time"],
                     "break_time":
-                        candle["datetime"],
+                        candles[i]["datetime"],
                     "close":
-                        candle["close"]
+                        candles[i]["close"]
                 }
 
-    elif direction == "SELL":
+    if direction == "SELL":
 
-        external_candidates = [
+        candidates = [
             p for p in lows
             if p["time"] > rejection_time
         ]
 
-        if not external_candidates:
+        if not candidates:
             return None
 
-        # Most recent external low.
-        external = external_candidates[-1]
+        external = candidates[-1]
 
         for i in range(
             external["index"] + 1,
             len(candles)
         ):
 
-            candle = candles[i]
-
-            # External BO requires a CLOSE below the low.
             if (
-                candle["close"]
+                candles[i]["close"]
                 < external["price"]
             ):
 
                 return {
                     "direction": "SELL",
-                    "type":
-                        "External BO",
                     "level":
                         external["price"],
                     "pivot_time":
                         external["time"],
                     "break_time":
-                        candle["datetime"],
+                        candles[i]["datetime"],
                     "close":
-                        candle["close"]
+                        candles[i]["close"]
                 }
 
     return None
 
 
 # ============================================================
-# BUILD ONE BIAS
+# BUILD BIAS
 # ============================================================
 
 def build_bias(
@@ -1313,10 +1150,6 @@ def build_bias(
     lower_name,
     lower_interval
 ):
-
-    # ========================================================
-    # 1. HIGHER TIMEFRAME
-    # ========================================================
 
     raw_htf = get_candles(
         symbol,
@@ -1331,13 +1164,6 @@ def build_bias(
         raw_htf
     )
 
-    if len(htf) < MIN_BARS:
-        return None
-
-    # ========================================================
-    # 2. FIND CURRENT HTF BRS
-    # ========================================================
-
     brs = find_latest_brs(
         htf
     )
@@ -1345,33 +1171,18 @@ def build_bias(
     if not brs:
         return None
 
-    # ========================================================
-    # 3. FIND KEY LEVEL
-    # ========================================================
-
-    key_levels = get_key_levels(
+    levels = get_key_levels(
         htf
     )
-
-    if not key_levels:
-        return None
-
-    # ========================================================
-    # 4. WAIT FOR HTF REJECTION
-    # ========================================================
 
     rejection = find_htf_rejection(
         htf,
         brs,
-        key_levels
+        levels
     )
 
     if not rejection:
         return None
-
-    # ========================================================
-    # 5. MOVE ONE TIMEFRAME LOWER
-    # ========================================================
 
     raw_lower = get_candles(
         symbol,
@@ -1386,29 +1197,17 @@ def build_bias(
         raw_lower
     )
 
-    if len(lower) < MIN_BARS:
-        return None
-
-    # ========================================================
-    # 6. WAIT FOR EXTERNAL BO
-    # ========================================================
-
-    external_bo = find_external_bo(
+    external = find_external_bo(
         lower,
         rejection["direction"],
         rejection["rejection_time"]
     )
 
-    if not external_bo:
+    if not external:
         return None
 
-    # ========================================================
-    # 7. FINAL BIAS
-    # ========================================================
-
     return {
-        "symbol":
-            symbol,
+        "symbol": symbol,
 
         "bias":
             rejection["direction"],
@@ -1444,21 +1243,21 @@ def build_bias(
             rejection["close"],
 
         "external_level":
-            external_bo["level"],
+            external["level"],
 
         "external_pivot_time":
-            external_bo["pivot_time"],
+            external["pivot_time"],
 
         "external_break_time":
-            external_bo["break_time"],
+            external["break_time"],
 
         "external_close":
-            external_bo["close"],
+            external["close"]
     }
 
 
 # ============================================================
-# SIGNAL ID
+# DUPLICATE PROTECTION
 # ============================================================
 
 def get_signal_id(signal):
@@ -1467,7 +1266,6 @@ def get_signal_id(signal):
         signal["symbol"],
         signal["bias"],
         signal["htf"],
-        signal["lower_tf"],
         signal["brs_time"],
         signal["key_type"],
         signal["rejection_time"],
@@ -1490,7 +1288,6 @@ def send_telegram(message):
     data = urllib.parse.urlencode({
         "chat_id":
             TELEGRAM_CHAT_ID,
-
         "text":
             message
     }).encode("utf-8")
@@ -1523,10 +1320,7 @@ def send_telegram(message):
 
 def make_alert(signal):
 
-    symbol = DISPLAY_NAMES.get(
-        signal["symbol"],
-        signal["symbol"]
-    )
+    name = signal["symbol"]
 
     direction = signal[
         "bias"
@@ -1534,7 +1328,7 @@ def make_alert(signal):
 
     return (
         f"🚨 {direction} · "
-        f"{symbol} · "
+        f"{name} · "
         f"{signal['htf']}→"
         f"{signal['lower_tf']}\n\n"
 
@@ -1574,9 +1368,6 @@ def make_alert(signal):
         f"Close: "
         f"{format_price(signal['external_close'])}\n\n"
 
-        f"Trend aligned with "
-        f"{signal['htf']}\n"
-
         f"✅ SLK Bias Confirmed\n"
 
         f"⚠️ Not an entry signal. "
@@ -1586,24 +1377,21 @@ def make_alert(signal):
 
 
 # ============================================================
-# SCAN ONE INSTRUMENT
+# SCAN
 # ============================================================
 
-def scan_instrument(name):
-
-    symbol = resolve_symbol(
-        name
-    )
-
-    if not symbol:
-        return []
+def scan_instrument(
+    name,
+    symbol
+):
 
     signals = []
 
-    # ========================================================
-    # WEEKLY BIAS -> DAILY EXTERNAL BO
-    # ========================================================
+    print(
+        f"Checking {name} -> {symbol}"
+    )
 
+    # W1 -> D1
     try:
 
         signal = build_bias(
@@ -1626,10 +1414,7 @@ def scan_instrument(name):
             f"{error}"
         )
 
-    # ========================================================
-    # DAILY BIAS -> H4 EXTERNAL BO
-    # ========================================================
-
+    # D1 -> H4
     try:
 
         signal = build_bias(
@@ -1655,20 +1440,16 @@ def scan_instrument(name):
     return signals
 
 
-# ============================================================
-# FULL MARKET SCAN
-# ============================================================
-
 def scan_market():
 
     global last_scan_time
 
     print(
-        "\n========================================"
+        "\n================================"
     )
 
     print(
-        "Starting SLK market scan"
+        "STARTING SLK MARKET SCAN"
     )
 
     print(
@@ -1676,66 +1457,55 @@ def scan_market():
     )
 
     print(
-        "W1 -> D1 External BO"
+        "Rate limit protected"
     )
 
     print(
-        "D1 -> H4 External BO"
+        "================================"
     )
 
-    print(
-        "========================================"
-    )
+    for name, symbol in INSTRUMENTS.items():
 
-    for name in INSTRUMENTS:
-
-        print(
-            f"Checking {name}..."
+        signals = scan_instrument(
+            name,
+            symbol
         )
 
-        try:
+        for signal in signals:
 
-            signals = scan_instrument(
-                name
+            sid = get_signal_id(
+                signal
             )
 
-            for signal in signals:
+            with state_lock:
 
-                sid = get_signal_id(
-                    signal
-                )
+                if sid in sent_signals:
+
+                    print(
+                        "Duplicate signal "
+                        "ignored."
+                    )
+
+                    continue
+
+            message = make_alert(
+                signal
+            )
+
+            print(
+                "\nNEW SIGNAL\n"
+                + message
+            )
+
+            if send_telegram(
+                message
+            ):
 
                 with state_lock:
 
-                    if sid in sent_signals:
-
-                        continue
-
-                message = make_alert(
-                    signal
-                )
-
-                print(
-                    "\nNEW SLK SIGNAL\n"
-                    + message
-                )
-
-                if send_telegram(
-                    message
-                ):
-
-                    with state_lock:
-
-                        sent_signals[
-                            sid
-                        ] = time.time()
-
-        except Exception as error:
-
-            print(
-                f"Instrument error "
-                f"{name}: {error}"
-            )
+                    sent_signals[
+                        sid
+                    ] = time.time()
 
     last_scan_time = (
         datetime.now(
@@ -1744,13 +1514,13 @@ def scan_market():
     )
 
     print(
-        "\nScan completed:"
-        f" {last_scan_time}"
+        "\nSCAN COMPLETED: "
+        + last_scan_time
     )
 
 
 # ============================================================
-# SCANNER LOOP
+# LOOP
 # ============================================================
 
 def scanner_loop():
@@ -1766,9 +1536,14 @@ def scanner_loop():
         except Exception as error:
 
             print(
-                f"Scanner loop error: "
+                f"Scanner error: "
                 f"{error}"
             )
+
+        print(
+            f"Next scan in "
+            f"{SCAN_INTERVAL} seconds."
+        )
 
         time.sleep(
             SCAN_INTERVAL
@@ -1776,34 +1551,28 @@ def scanner_loop():
 
 
 # ============================================================
-# START BOT
+# MAIN
 # ============================================================
 
 def main():
 
     if not TWELVE_DATA_API_KEY:
-
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY "
-            "is missing."
+            "TWELVE_DATA_API_KEY missing."
         )
 
     if not TELEGRAM_BOT_TOKEN:
-
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN "
-            "is missing."
+            "TELEGRAM_BOT_TOKEN missing."
         )
 
     if not TELEGRAM_CHAT_ID:
-
         raise RuntimeError(
-            "TELEGRAM_CHAT_ID "
-            "is missing."
+            "TELEGRAM_CHAT_ID missing."
         )
 
     print(
-        "========================================"
+        "================================"
     )
 
     print(
@@ -1811,7 +1580,7 @@ def main():
     )
 
     print(
-        "========================================"
+        "================================"
     )
 
     print(
@@ -1819,19 +1588,24 @@ def main():
     )
 
     print(
-        "Weekly bias -> Daily BO"
+        "W1 -> D1 External BO"
     )
 
     print(
-        "Daily bias -> H4 BO"
+        "D1 -> H4 External BO"
     )
 
     print(
-        "Bias only."
+        "API rate protection ON"
     )
 
     print(
-        "========================================"
+        "Scan interval: "
+        f"{SCAN_INTERVAL}s"
+    )
+
+    print(
+        "================================"
     )
 
     Thread(
@@ -1847,6 +1621,7 @@ def main():
     while True:
 
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
