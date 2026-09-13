@@ -1,30 +1,58 @@
 import os
 import time
+import threading
 import json
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "900"))  # 15 minutes
+PORT = int(os.getenv("PORT", "10000"))
+
+TWELVE_DATA_URL = "https://api.twelvedata.com"
 
 
-if not TWELVE_DATA_API_KEY:
-    raise RuntimeError("Missing TWELVE_DATA_API_KEY")
+# ============================================================
+# BASIC HTTP SERVER FOR RENDER WEB SERVICE
+# ============================================================
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+class HealthHandler(BaseHTTPRequestHandler):
 
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_CHAT_ID")
+    def do_GET(self):
+        if self.path in ["/", "/health"]:
+            response = {
+                "status": "running",
+                "service": "SLK Bias Trading Bot"
+            }
+
+            body = json.dumps(response).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_web_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Web service running on port {PORT}")
+    server.serve_forever()
 
 
 # ============================================================
@@ -32,147 +60,152 @@ if not TELEGRAM_CHAT_ID:
 # ============================================================
 
 def get_json(url, params=None):
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
+    try:
+        if params:
+            url += "?" + urlencode(params)
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "SLK-Bias-Bot/1.0"}
-    )
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "SLK-Bias-Bot/1.0"
+            }
+        )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
 
-
-def twelve_data(endpoint, params):
-    params["apikey"] = TWELVE_DATA_API_KEY
-
-    url = "https://api.twelvedata.com/" + endpoint
-
-    data = get_json(url, params)
-
-    if isinstance(data, dict) and data.get("status") == "error":
-        raise RuntimeError(data.get("message", "Twelve Data error"))
-
-    return data
+    except Exception as e:
+        print(f"Request error: {e}")
+        return None
 
 
 # ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    payload = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }).encode()
-
-    request = urllib.request.Request(url, data=payload)
-
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode())
-
-
-# ============================================================
-# MARKET DATA
+# TWELVE DATA
 # ============================================================
 
 def get_candles(symbol, interval, outputsize=120):
-    data = twelve_data(
-        "time_series",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize,
-            "order": "asc"
-        }
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON"
+    }
+
+    data = get_json(
+        f"{TWELVE_DATA_URL}/time_series",
+        params
     )
 
-    values = data.get("values", [])
+    if not data or "values" not in data:
+        return []
 
     candles = []
 
-    for c in values:
-        candles.append({
-            "datetime": c["datetime"],
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"])
-        })
+    for item in reversed(data["values"]):
+        try:
+            candles.append({
+                "datetime": item["datetime"],
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"])
+            })
+        except (KeyError, ValueError):
+            continue
 
     return candles
 
 
-# ============================================================
-# FOREX UNIVERSE
-# ============================================================
-
 def get_forex_pairs():
-    data = twelve_data("forex_pairs", {})
+    params = {
+        "apikey": TWELVE_DATA_API_KEY
+    }
 
-    pairs = data.get("data", [])
+    data = get_json(
+        f"{TWELVE_DATA_URL}/forex_pairs",
+        params
+    )
 
-    symbols = []
+    if not data:
+        return []
 
-    for pair in pairs:
-        group = str(pair.get("currency_group", "")).lower()
+    pairs = []
 
-        if group in ("major", "minor"):
-            symbol = pair.get("symbol")
+    for item in data.get("data", []):
+        group = str(item.get("currency_group", "")).lower()
+
+        if group in ["major", "minor"]:
+            symbol = item.get("symbol")
 
             if symbol:
-                symbols.append(symbol)
+                pairs.append(symbol)
 
-    return sorted(set(symbols))
+    return sorted(set(pairs))
 
+
+# ============================================================
+# SPECIAL MARKETS
+# ============================================================
 
 SPECIAL_MARKETS = {
-    "XAUUSD": ["XAU/USD", "XAUUSD"],
-    "JP225": ["JP225", "NIKKEI", "NI225"],
-    "NAS100": ["NAS100", "NDX"],
-    "UK100": ["UK100", "FTSE"],
-    "GERMAN": ["DE40", "DE30", "DAX"]
+    "XAUUSD": [
+        "XAU/USD",
+        "XAUUSD"
+    ],
+
+    "JP225": [
+        "JP225",
+        "NIKKEI",
+        "NI225"
+    ],
+
+    "NAS100": [
+        "NAS100",
+        "NDX"
+    ],
+
+    "UK100": [
+        "UK100",
+        "FTSE"
+    ],
+
+    "GERMAN": [
+        "DE40",
+        "DE30",
+        "DAX"
+    ]
 }
 
 
-def build_market_list():
-    markets = []
+def get_special_symbol(name):
+    for symbol in SPECIAL_MARKETS.get(name, []):
+        candles = get_candles(symbol, "1day", 5)
 
-    try:
-        markets.extend(get_forex_pairs())
-    except Exception as e:
-        print("Forex pair discovery failed:", e)
+        if candles:
+            return symbol
 
-    for name, candidates in SPECIAL_MARKETS.items():
-        markets.append(candidates[0])
-
-    return sorted(set(markets))
+    return None
 
 
 # ============================================================
-# CANDLE HELPERS
+# CANDLE UTILITIES
 # ============================================================
 
-def bullish(c):
-    return c["close"] > c["open"]
+def bullish(candle):
+    return candle["close"] > candle["open"]
 
 
-def bearish(c):
-    return c["close"] < c["open"]
+def bearish(candle):
+    return candle["close"] < candle["open"]
 
 
-def body(c):
-    return abs(c["close"] - c["open"])
+def candle_range(candle):
+    return candle["high"] - candle["low"]
 
 
-def midpoint(a, b):
-    return (a + b) / 2
+def body_size(candle):
+    return abs(candle["close"] - candle["open"])
 
 
 # ============================================================
@@ -183,18 +216,20 @@ def detect_resistance(candles):
     if len(candles) < 3:
         return None
 
-    a = candles[-3]
-    b = candles[-2]
-    c = candles[-1]
+    for i in range(len(candles) - 2, 0, -1):
+        left = candles[i - 1]
+        middle = candles[i]
+        right = candles[i + 1]
 
-    if bullish(a) and bearish(b):
-        level = max(a["high"], b["high"])
-
-        return {
-            "pattern": "Resistance",
-            "level": level,
-            "direction": "SELL"
-        }
+        if (
+            middle["high"] >= left["high"]
+            and middle["high"] >= right["high"]
+            and bearish(right)
+        ):
+            return {
+                "type": "Resistance",
+                "level": middle["high"]
+            }
 
     return None
 
@@ -203,18 +238,20 @@ def detect_support(candles):
     if len(candles) < 3:
         return None
 
-    a = candles[-3]
-    b = candles[-2]
-    c = candles[-1]
+    for i in range(len(candles) - 2, 0, -1):
+        left = candles[i - 1]
+        middle = candles[i]
+        right = candles[i + 1]
 
-    if bearish(a) and bullish(b):
-        level = min(a["low"], b["low"])
-
-        return {
-            "pattern": "Support",
-            "level": level,
-            "direction": "BUY"
-        }
+        if (
+            middle["low"] <= left["low"]
+            and middle["low"] <= right["low"]
+            and bullish(right)
+        ):
+            return {
+                "type": "Support",
+                "level": middle["low"]
+            }
 
     return None
 
@@ -223,150 +260,161 @@ def detect_ocl(candles):
     if len(candles) < 3:
         return None
 
-    a = candles[-3]
-    b = candles[-2]
+    for i in range(len(candles) - 2, 0, -1):
+        first = candles[i]
+        second = candles[i + 1]
 
-    if bullish(a) and bullish(b):
-        level = midpoint(a["open"], a["close"])
+        if bullish(first) and bullish(second):
+            return {
+                "type": "OCL",
+                "level": first["open"]
+            }
 
-        return {
-            "pattern": "Bullish OCL",
-            "level": level,
-            "direction": "BUY"
-        }
-
-    if bearish(a) and bearish(b):
-        level = midpoint(a["open"], a["close"])
-
-        return {
-            "pattern": "Bearish OCL",
-            "level": level,
-            "direction": "SELL"
-        }
+        if bearish(first) and bearish(second):
+            return {
+                "type": "OCL",
+                "level": first["open"]
+            }
 
     return None
 
 
 def detect_rbs_sbr(candles):
-    if len(candles) < 6:
+    if len(candles) < 5:
         return None
 
-    old = candles[-6]
-    break_candle = candles[-4]
-    retest = candles[-2]
+    for i in range(len(candles) - 3, 1, -1):
 
-    old_high = old["high"]
-    old_low = old["low"]
+        old_level = candles[i]["high"]
 
-    # Resistance broken upward and later rejected as support
-    if (
-        break_candle["close"] > old_high
-        and retest["low"] <= old_high
-        and retest["close"] > old_high
-    ):
-        return {
-            "pattern": "RBS",
-            "level": old_high,
-            "direction": "BUY"
-        }
+        # Resistance becoming support
+        if (
+            candles[i + 1]["close"] > old_level
+            and candles[i + 2]["low"] <= old_level
+            and candles[i + 2]["close"] > old_level
+        ):
+            return {
+                "type": "RBS",
+                "level": old_level
+            }
 
-    # Support broken downward and later rejected as resistance
-    if (
-        break_candle["close"] < old_low
-        and retest["high"] >= old_low
-        and retest["close"] < old_low
-    ):
-        return {
-            "pattern": "SBR",
-            "level": old_low,
-            "direction": "SELL"
-        }
+        old_level = candles[i]["low"]
+
+        # Support becoming resistance
+        if (
+            candles[i + 1]["close"] < old_level
+            and candles[i + 2]["high"] >= old_level
+            and candles[i + 2]["close"] < old_level
+        ):
+            return {
+                "type": "SBR",
+                "level": old_level
+            }
 
     return None
 
 
 # ============================================================
-# QMR
+# QMR / QUASIMODO REVERSAL
 # ============================================================
 
 def detect_qmr(candles):
-    if len(candles) < 7:
+    """
+    QMR reference:
+
+    Bearish QM:
+    Left Shoulder high
+    -> Head higher high
+    -> break of prior low
+    -> Right Shoulder lower high
+
+    QM level = Left Shoulder high
+
+    Bullish QM:
+    Left Shoulder low
+    -> Head lower low
+    -> break of prior high
+    -> Right Shoulder higher low
+
+    This is a structural approximation and should be
+    validated against the user's SLK reference examples.
+    """
+
+    if len(candles) < 10:
         return None
 
-    a = candles[-7]
-    b = candles[-6]
-    c = candles[-5]
-    d = candles[-4]
-    e = candles[-3]
-    f = candles[-2]
+    # Search recent structures.
+    start = max(2, len(candles) - 50)
 
-    # --------------------------------------------------------
-    # BEARISH QUASIMODO
-    #
-    # Left shoulder
-    # Pullback
-    # Head = higher high
-    # Break below previous structure
-    # Right shoulder = lower high
-    # QMR level = left shoulder high
-    # --------------------------------------------------------
+    for i in range(len(candles) - 3, start - 1, -1):
 
-    if (
-        a["high"] < c["high"]
-        and c["high"] > e["high"]
-        and e["high"] < c["high"]
-        and f["close"] < a["low"]
-    ):
-        return {
-            "pattern": "Bearish QMR",
-            "level": a["high"],
-            "direction": "SELL"
-        }
+        ls = candles[i - 2]
+        pullback = candles[i - 1]
+        head = candles[i]
 
-    # --------------------------------------------------------
-    # BULLISH QUASIMODO
-    #
-    # Left shoulder
-    # Pullback
-    # Head = lower low
-    # Break above previous structure
-    # Right shoulder = higher low
-    # QMR level = left shoulder low
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # BEARISH QMR
+        # ----------------------------------------------------
 
-    if (
-        a["low"] > c["low"]
-        and c["low"] < e["low"]
-        and e["low"] > c["low"]
-        and f["close"] > a["high"]
-    ):
-        return {
-            "pattern": "Bullish QMR",
-            "level": a["low"],
-            "direction": "BUY"
-        }
+        if (
+            ls["high"] > pullback["high"]
+            and head["high"] > ls["high"]
+        ):
 
-    return None
+            left_low = min(
+                ls["low"],
+                pullback["low"]
+            )
 
+            # Find break below prior low
+            for j in range(i + 1, min(i + 5, len(candles))):
 
-# ============================================================
-# DAILY KEY LEVEL
-# ============================================================
+                if candles[j]["close"] < left_low:
 
-def find_daily_key_level(candles):
-    detectors = [
-        detect_qmr,
-        detect_rbs_sbr,
-        detect_ocl,
-        detect_resistance,
-        detect_support
-    ]
+                    # Look for right shoulder
+                    for k in range(j + 1, min(j + 5, len(candles))):
 
-    for detector in detectors:
-        result = detector(candles)
+                        if (
+                            candles[k]["high"] < head["high"]
+                            and candles[k]["high"] < ls["high"]
+                        ):
+                            return {
+                                "type": "QMR",
+                                "direction": "SELL",
+                                "level": ls["high"]
+                            }
 
-        if result:
-            return result
+        # ----------------------------------------------------
+        # BULLISH QMR
+        # ----------------------------------------------------
+
+        if (
+            ls["low"] < pullback["low"]
+            and head["low"] < ls["low"]
+        ):
+
+            left_high = max(
+                ls["high"],
+                pullback["high"]
+            )
+
+            # Find break above prior high
+            for j in range(i + 1, min(i + 5, len(candles))):
+
+                if candles[j]["close"] > left_high:
+
+                    # Look for right shoulder
+                    for k in range(j + 1, min(j + 5, len(candles))):
+
+                        if (
+                            candles[k]["low"] > head["low"]
+                            and candles[k]["low"] > ls["low"]
+                        ):
+                            return {
+                                "type": "QMR",
+                                "direction": "BUY",
+                                "level": ls["low"]
+                            }
 
     return None
 
@@ -375,29 +423,70 @@ def find_daily_key_level(candles):
 # DAILY REJECTION
 # ============================================================
 
-def confirm_daily_bias(candles, key):
-    if not key:
+def confirm_daily_rejection(candles, key_level):
+    if not candles or not key_level:
         return None
 
-    candle = candles[-1]
+    latest = candles[-1]
+    level = key_level["level"]
 
-    level = key["level"]
+    touched = (
+        latest["low"] <= level <= latest["high"]
+    )
 
-    # BUY rejection
-    if key["direction"] == "BUY":
-        if (
-            candle["low"] <= level
-            and candle["close"] > level
-        ):
-            return "BUY"
+    if not touched:
+        return None
 
-    # SELL rejection
-    if key["direction"] == "SELL":
-        if (
-            candle["high"] >= level
-            and candle["close"] < level
-        ):
-            return "SELL"
+    if bullish(latest) and latest["close"] > level:
+        return {
+            "bias": "BUY",
+            "rejection": "Bullish rejection",
+            "close": latest["close"]
+        }
+
+    if bearish(latest) and latest["close"] < level:
+        return {
+            "bias": "SELL",
+            "rejection": "Bearish rejection",
+            "close": latest["close"]
+        }
+
+    return None
+
+
+# ============================================================
+# FIND DAILY BIAS
+# ============================================================
+
+def find_daily_bias(candles):
+    detectors = [
+        detect_qmr,
+        detect_rbs_sbr,
+        detect_resistance,
+        detect_support,
+        detect_ocl
+    ]
+
+    for detector in detectors:
+
+        key = detector(candles)
+
+        if not key:
+            continue
+
+        rejection = confirm_daily_rejection(
+            candles,
+            key
+        )
+
+        if rejection:
+            return {
+                "pattern": key["type"],
+                "level": key["level"],
+                "bias": rejection["bias"],
+                "rejection": rejection["rejection"],
+                "close": rejection["close"]
+            }
 
     return None
 
@@ -406,21 +495,31 @@ def confirm_daily_bias(candles, key):
 # H4 BOS
 # ============================================================
 
-def h4_bos(candles):
+def detect_h4_bos(candles):
     if len(candles) < 6:
         return None
 
-    previous = candles[-3]
-    current = candles[-1]
+    recent = candles[-6:]
 
-    previous_high = previous["high"]
-    previous_low = previous["low"]
+    # BUY BOS
+    previous_high = max(
+        candle["high"]
+        for candle in recent[:-1]
+    )
 
-    if current["close"] > previous_high:
-        return "BUY"
+    latest = recent[-1]
 
-    if current["close"] < previous_low:
-        return "SELL"
+    if latest["close"] > previous_high:
+        return "BUY BOS"
+
+    # SELL BOS
+    previous_low = min(
+        candle["low"]
+        for candle in recent[:-1]
+    )
+
+    if latest["close"] < previous_low:
+        return "SELL BOS"
 
     return None
 
@@ -429,31 +528,73 @@ def h4_bos(candles):
 # H4 SWEEP + BREAK
 # ============================================================
 
-def h4_sweep_and_break(candles):
+def detect_h4_sweep_break(candles):
     if len(candles) < 8:
         return None
 
-    sweep = candles[-4]
-    confirmation = candles[-1]
+    recent = candles[-8:]
 
-    earlier_high = max(c["high"] for c in candles[-8:-4])
-    earlier_low = min(c["low"] for c in candles[-8:-4])
-
+    # --------------------------------------------------------
     # BUY:
-    # downside sweep first, then upside break
-    if (
-        sweep["low"] < earlier_low
-        and confirmation["close"] > sweep["high"]
-    ):
-        return "BUY"
+    # downside sweep / bearish BOS first
+    # followed by bullish CHOCH
+    # --------------------------------------------------------
 
+    for i in range(2, len(recent) - 1):
+
+        before = recent[:i]
+        sweep = recent[i]
+
+        prior_low = min(
+            c["low"] for c in before
+        )
+
+        if sweep["low"] < prior_low:
+
+            after = recent[i + 1:]
+
+            if not after:
+                continue
+
+            previous_high = max(
+                c["high"] for c in before
+            )
+
+            for confirmation in after:
+
+                if confirmation["close"] > previous_high:
+                    return "BUY Sweep + CHOCH"
+
+    # --------------------------------------------------------
     # SELL:
-    # upside sweep first, then downside break
-    if (
-        sweep["high"] > earlier_high
-        and confirmation["close"] < sweep["low"]
-    ):
-        return "SELL"
+    # upside sweep / bullish BOS first
+    # followed by bearish CHOCH
+    # --------------------------------------------------------
+
+    for i in range(2, len(recent) - 1):
+
+        before = recent[:i]
+        sweep = recent[i]
+
+        prior_high = max(
+            c["high"] for c in before
+        )
+
+        if sweep["high"] > prior_high:
+
+            after = recent[i + 1:]
+
+            if not after:
+                continue
+
+            previous_low = min(
+                c["low"] for c in before
+            )
+
+            for confirmation in after:
+
+                if confirmation["close"] < previous_low:
+                    return "SELL Sweep + CHOCH"
 
     return None
 
@@ -462,134 +603,256 @@ def h4_sweep_and_break(candles):
 # H4 CONFIRMATION
 # ============================================================
 
-def get_h4_confirmation(candles):
-    sweep_break = h4_sweep_and_break(candles)
+def find_h4_confirmation(candles, daily_bias):
+    sweep_break = detect_h4_sweep_break(candles)
 
     if sweep_break:
-        return sweep_break, "Sweep + Break"
 
-    bos = h4_bos(candles)
+        if daily_bias == "BUY" and sweep_break.startswith("BUY"):
+            return sweep_break
+
+        if daily_bias == "SELL" and sweep_break.startswith("SELL"):
+            return sweep_break
+
+    bos = detect_h4_bos(candles)
 
     if bos:
-        return bos, "BOS"
 
-    return None, None
+        if daily_bias == "BUY" and bos.startswith("BUY"):
+            return bos
+
+        if daily_bias == "SELL" and bos.startswith("SELL"):
+            return bos
+
+    return None
 
 
 # ============================================================
-# FINAL SLK BIAS
+# TELEGRAM
 # ============================================================
 
-def analyze_market(symbol):
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials missing.")
+        return False
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }).encode()
+
     try:
-        daily = get_candles(symbol, "1day", 120)
-        h4 = get_candles(symbol, "4h", 120)
+        request = Request(
+            url,
+            data=payload,
+            method="POST"
+        )
 
-        if len(daily) < 10 or len(h4) < 10:
-            return None
-
-        key = find_daily_key_level(daily)
-
-        if not key:
-            return None
-
-        daily_bias = confirm_daily_bias(daily, key)
-
-        if not daily_bias:
-            return None
-
-        h4_bias, confirmation = get_h4_confirmation(h4)
-
-        if not h4_bias:
-            return None
-
-        # Daily and H4 must agree
-        if daily_bias != h4_bias:
-            return None
-
-        return {
-            "symbol": symbol,
-            "pattern": key["pattern"],
-            "level": key["level"],
-            "daily_bias": daily_bias,
-            "h4_confirmation": confirmation,
-            "last_daily_close": daily[-1]["close"],
-            "reason": (
-                f"{key['pattern']} rejection confirmed on Daily, "
-                f"followed by H4 {confirmation} in the same direction."
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(
+                response.read().decode("utf-8")
             )
-        }
+
+        return result.get("ok", False)
 
     except Exception as e:
-        print(f"{symbol} error:", e)
-        return None
+        print(f"Telegram error: {e}")
+        return False
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# ALERT FORMAT
 # ============================================================
 
-def format_alert(result):
-    bias = result["daily_bias"]
-
-    emoji = "🟢" if bias == "BUY" else "🔴"
-
+def format_alert(symbol, daily, h4_confirmation):
     return (
-        f"{emoji} SLK BIAS ALERT\n\n"
-        f"Symbol: {result['symbol']}\n"
-        f"Pattern: {result['pattern']}\n"
-        f"Key Level: {result['level']:.5f}\n"
-        f"Daily Bias: {bias}\n"
-        f"H4 Confirmation: {result['h4_confirmation']}\n"
-        f"Daily Close: {result['last_daily_close']:.5f}\n\n"
-        f"Reason: {result['reason']}\n\n"
-        f"⚠️ Bias only — no trade execution."
+        "📊 SLK BIAS ALERT\n\n"
+        f"Symbol: {symbol}\n"
+        f"Pattern: {daily['pattern']}\n"
+        f"Key Level: {daily['level']}\n"
+        f"Rejection: {daily['rejection']}\n"
+        f"Close: {daily['close']}\n"
+        f"Daily Bias: {daily['bias']}\n"
+        f"H4 Confirmation: {h4_confirmation}\n\n"
+        f"Reason: Daily {daily['bias']} rejection "
+        f"at {daily['pattern']} + H4 confirmation."
     )
 
 
 # ============================================================
-# MAIN SCANNER
+# SYMBOL SCANNER
 # ============================================================
 
-def scan():
-    print("Building market list...")
+def scan_symbol(symbol):
+    print(f"Scanning {symbol}...")
 
-    markets = build_market_list()
+    daily = get_candles(
+        symbol,
+        "1day",
+        120
+    )
 
-    print(f"Markets found: {len(markets)}")
+    h4 = get_candles(
+        symbol,
+        "4h",
+        120
+    )
 
-    alerts = 0
+    if len(daily) < 10 or len(h4) < 10:
+        print(f"Not enough data for {symbol}")
+        return None
 
-    for symbol in markets:
-        print("Scanning:", symbol)
+    daily_bias = find_daily_bias(daily)
 
-        result = analyze_market(symbol)
+    if not daily_bias:
+        return None
 
-        if result:
-            message = format_alert(result)
+    h4_confirmation = find_h4_confirmation(
+        h4,
+        daily_bias["bias"]
+    )
 
-            try:
-                send_telegram(message)
-                alerts += 1
-                print("Alert sent:", symbol)
-            except Exception as e:
-                print("Telegram error:", e)
+    if not h4_confirmation:
+        return None
 
-    print(f"Scan completed. Alerts sent: {alerts}")
+    return format_alert(
+        symbol,
+        daily_bias,
+        h4_confirmation
+    )
 
 
 # ============================================================
-# RUN
+# DUPLICATE ALERT PROTECTION
+# ============================================================
+
+sent_signals = {}
+
+
+def should_send(symbol, message):
+    previous = sent_signals.get(symbol)
+
+    if previous == message:
+        return False
+
+    sent_signals[symbol] = message
+    return True
+
+
+# ============================================================
+# FULL MARKET SCAN
+# ============================================================
+
+def run_scan():
+    print("\n================================")
+    print("Starting SLK market scan")
+    print("================================")
+
+    symbols = get_forex_pairs()
+
+    print(f"Found {len(symbols)} forex pairs.")
+
+    # Add special markets
+    for market_name in SPECIAL_MARKETS:
+
+        symbol = get_special_symbol(market_name)
+
+        if symbol:
+            symbols.append(symbol)
+            print(
+                f"{market_name} available as {symbol}"
+            )
+
+    symbols = sorted(set(symbols))
+
+    for symbol in symbols:
+
+        try:
+            alert = scan_symbol(symbol)
+
+            if alert:
+
+                if should_send(symbol, alert):
+
+                    print(alert)
+                    send_telegram(alert)
+
+                else:
+                    print(
+                        f"Duplicate signal skipped: {symbol}"
+                    )
+
+        except Exception as e:
+            print(
+                f"Error scanning {symbol}: {e}"
+            )
+
+        # Small delay to reduce API pressure
+        time.sleep(1)
+
+    print("Scan completed.")
+
+
+# ============================================================
+# BACKGROUND SCANNER
+# ============================================================
+
+def scanner_loop():
+
+    print("SLK scanner started.")
+
+    while True:
+
+        try:
+            run_scan()
+
+        except Exception as e:
+            print(
+                f"Scanner error: {e}"
+            )
+
+        print(
+            f"Waiting {SCAN_INTERVAL} seconds "
+            f"until next scan..."
+        )
+
+        time.sleep(SCAN_INTERVAL)
+
+
+# ============================================================
+# START EVERYTHING
 # ============================================================
 
 if __name__ == "__main__":
-    print("SLK Bias Bot started.")
 
-    while True:
-        try:
-            scan()
-        except Exception as e:
-            print("Scanner error:", e)
+    if not TWELVE_DATA_API_KEY:
+        print("WARNING: TWELVE_DATA_API_KEY is missing.")
 
-        print(f"Waiting {SCAN_INTERVAL} seconds...")
-        time.sleep(SCAN_INTERVAL)
+    if not TELEGRAM_BOT_TOKEN:
+        print("WARNING: TELEGRAM_BOT_TOKEN is missing.")
+
+    if not TELEGRAM_CHAT_ID:
+        print("WARNING: TELEGRAM_CHAT_ID is missing.")
+
+    # Start Render web server
+    web_thread = threading.Thread(
+        target=start_web_server,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    # Start SLK scanner
+    scanner_thread = threading.Thread(
+        target=scanner_loop,
+        daemon=True
+    )
+
+  
+    
+        
