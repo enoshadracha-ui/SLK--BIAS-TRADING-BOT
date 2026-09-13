@@ -1,133 +1,1377 @@
 import os
 import time
+import threading
 import json
-import urllib.parse
-import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread, Lock
 from datetime import datetime, timezone
-
-
-# ============================================================
-# SLK BIAS BOT
-#
-# W1 -> D1 EXTERNAL BO
-# D1 -> H4 EXTERNAL BO
-#
-# BIAS ONLY
-# ============================================================
-
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ============================================================
-# ENVIRONMENT
+# CONFIG
 # ============================================================
 
-TWELVE_DATA_API_KEY = os.getenv(
-    "TWELVE_DATA_API_KEY", ""
-).strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
+# Main loop wakes every 5 minutes, but Twelve Data calls are
+# throttled and cached so the bot does not burst requests.
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
-
-# 4 hours
-SCAN_INTERVAL = int(
-    os.getenv("SCAN_INTERVAL", "14400")
+# Twelve Data Basic currently allows 8 API credits/minute.
+# 8.5 seconds between calls keeps this bot below that ceiling.
+REQUEST_MIN_INTERVAL = float(
+    os.getenv("REQUEST_MIN_INTERVAL", "8.5")
 )
 
-PORT = int(
-    os.getenv("PORT", "10000")
-)
+# If Twelve Data returns 429 anyway, wait for the next minute
+# before allowing another API request.
+RATE_LIMIT_SLEEP = int(os.getenv("RATE_LIMIT_SLEEP", "65"))
 
+PORT = int(os.getenv("PORT", "10000"))
 
-# ============================================================
-# FIXED 14 INSTRUMENTS
-# ============================================================
+# Used only as the market clock for detecting a new Daily candle.
+DAILY_CLOCK_SYMBOL = os.getenv("DAILY_CLOCK_SYMBOL", "EUR/USD")
 
-INSTRUMENTS = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "USDCHF": "USD/CHF",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
+# Used only as the market clock for detecting a new completed H4 candle.
+H4_CLOCK_SYMBOL = os.getenv("H4_CLOCK_SYMBOL", "EUR/USD")
 
-    "EURGBP": "EUR/GBP",
-    "EURJPY": "EUR/JPY",
-    "GBPJPY": "GBP/JPY",
-    "AUDJPY": "AUD/JPY",
+TWELVE_DATA_URL = "https://api.twelvedata.com"
 
-    "JP225": "JP225",
-    "UK100": "UK100",
-    "NAS100": "NAS100",
-    "XAUUSD": "XAU/USD",
-}
-
+# Cache lifetimes.
+DAILY_CACHE_TTL = int(os.getenv("DAILY_CACHE_TTL", "21600"))   # 6 hours
+H4_CACHE_TTL = int(os.getenv("H4_CACHE_TTL", "900"))           # 15 min
+RESOLUTION_CACHE_TTL = int(os.getenv("RESOLUTION_CACHE_TTL", "86400"))
 
 # ============================================================
-# SETTINGS
+# FIXED INSTRUMENT LIST
 # ============================================================
 
-PIVOT_STRENGTH = 2
-MIN_BARS = 40
-KEY_LOOKBACK = 100
-LEVEL_TOLERANCE = 0.0025
-
+INSTRUMENTS_CONFIG = [
+    {"name": "EURUSD", "symbols": ["EUR/USD", "EURUSD"]},
+    {"name": "GBPUSD", "symbols": ["GBP/USD", "GBPUSD"]},
+    {"name": "USDJPY", "symbols": ["USD/JPY", "USDJPY"]},
+    {"name": "USDCHF", "symbols": ["USD/CHF", "USDCHF"]},
+    {"name": "AUDUSD", "symbols": ["AUD/USD", "AUDUSD"]},
+    {"name": "USDCAD", "symbols": ["USD/CAD", "USDCAD"]},
+    {"name": "EURGBP", "symbols": ["EUR/GBP", "EURGBP"]},
+    {"name": "EURJPY", "symbols": ["EUR/JPY", "EURJPY"]},
+    {"name": "GBPJPY", "symbols": ["GBP/JPY", "GBPJPY"]},
+    {"name": "AUDJPY", "symbols": ["AUD/JPY", "AUDJPY"]},
+    {"name": "JP225", "symbols": ["JP225", "NIKKEI", "NI225"]},
+    {"name": "UK100", "symbols": ["UK100", "FTSE"]},
+    {"name": "NAS100", "symbols": ["NAS100", "NDX"]},
+    {"name": "XAUUSD", "symbols": ["XAU/USD", "XAUUSD"]},
+]
 
 # ============================================================
 # STATE
 # ============================================================
 
-cache = {}
-sent_signals = {}
+ACTIVE_SETUPS = {}
+ALERTED_SETUPS = set()
+RESOLVED_SYMBOLS = {}
+RESOLUTION_TIMES = {}
 
-state_lock = Lock()
+LAST_DAILY_CLOCK = None
+LAST_H4_CLOCK = None
 
-last_scan_time = None
+INSTRUMENTS = []
 
-# ------------------------------------------------------------
-# API RATE LIMIT
-#
-# Free plan = 8 credits/minute.
-# We deliberately stay below that.
-# ------------------------------------------------------------
+# API request/caching state.
+API_LOCK = threading.Lock()
+LAST_API_REQUEST = 0.0
+DATA_CACHE = {}
 
-api_lock = Lock()
+# ============================================================
+# DATE/TIME
+# ============================================================
 
-last_api_call = 0
+def parse_dt(value):
+    if not value:
+        return None
 
-API_DELAY = 9.0
+    text = str(value).strip()
 
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d",
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+# ============================================================
+# HTTP HELPER
+# ============================================================
+
+def http_get(url, params=None):
+    global LAST_API_REQUEST
+
+    if params:
+        url = url + "?" + urlencode(params)
+
+    # One global gate for every Twelve Data request.
+    with API_LOCK:
+        now = time.monotonic()
+        wait_for = REQUEST_MIN_INTERVAL - (now - LAST_API_REQUEST)
+
+        if wait_for > 0:
+            time.sleep(wait_for)
+
+        LAST_API_REQUEST = time.monotonic()
+
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "SLK-Bias-Trading-Bot/3.0"
+            }
+        )
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw)
+
+        except HTTPError as e:
+            if e.code == 429:
+                print(
+                    "Twelve Data rate limit reached (429). "
+                    f"Waiting {RATE_LIMIT_SLEEP}s before retrying later."
+                )
+                # Do not recursively retry. This prevents a 429 storm.
+                time.sleep(RATE_LIMIT_SLEEP)
+                return None
+
+            try:
+                body = e.read().decode("utf-8")
+                print(f"HTTP error {e.code}: {body[:300]}")
+            except Exception:
+                print(f"HTTP error {e.code}")
+
+            return None
+
+        except URLError as e:
+            print(f"Network error: {e}")
+            return None
+
+        except Exception as e:
+            print(f"HTTP error: {e}")
+            return None
+
+# ============================================================
+# TWELVE DATA
+# ============================================================
+
+def _cache_ttl(interval):
+    if interval == "1day":
+        return DAILY_CACHE_TTL
+    if interval == "4h":
+        return H4_CACHE_TTL
+    return 300
+
+
+def get_time_series(symbol, interval, outputsize=200, force=False):
+    if not symbol:
+        return []
+
+    cache_key = (
+        str(symbol),
+        str(interval),
+        int(outputsize),
+    )
+
+    now = time.time()
+
+    if not force:
+        cached = DATA_CACHE.get(cache_key)
+        if cached:
+            cached_at, candles = cached
+            if now - cached_at < _cache_ttl(interval):
+                return candles
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+    }
+
+    data = http_get(
+        f"{TWELVE_DATA_URL}/time_series",
+        params,
+    )
+
+    if not data:
+        return []
+
+    if "values" not in data:
+        if "message" in data:
+            print(
+                f"{symbol} {interval}: "
+                f"{data.get('message')}"
+            )
+        return []
+
+    candles = []
+
+    for item in data["values"]:
+        try:
+            candles.append({
+                "datetime": item["datetime"],
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+            })
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+    candles.sort(
+        key=lambda x: (
+            parse_dt(x["datetime"])
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+    )
+
+    DATA_CACHE[cache_key] = (now, candles)
+
+    return candles
+
+# ============================================================
+# FIXED INSTRUMENT LIST
+# ============================================================
+
+def build_instrument_list():
+    return [
+        dict(item)
+        for item in INSTRUMENTS_CONFIG
+    ]
+
+# ============================================================
+# SYMBOL RESOLUTION
+# ============================================================
+
+def resolve_symbol(item):
+    name = item["name"]
+    now = time.time()
+
+    if name in RESOLVED_SYMBOLS:
+        resolved_at = RESOLUTION_TIMES.get(name, 0)
+
+        if (
+            RESOLVED_SYMBOLS[name] is not None
+            and now - resolved_at < RESOLUTION_CACHE_TTL
+        ):
+            return RESOLVED_SYMBOLS[name]
+
+    for symbol in item["symbols"]:
+        candles = get_time_series(
+            symbol,
+            "1day",
+            3,
+        )
+
+        if candles:
+            RESOLVED_SYMBOLS[name] = symbol
+            RESOLUTION_TIMES[name] = now
+            print(f"Resolved {name} -> {symbol}")
+            return symbol
+
+    RESOLVED_SYMBOLS[name] = None
+    RESOLUTION_TIMES[name] = now
+    print(f"Could not resolve {name}")
+    return None
+
+# ============================================================
+# BASIC CANDLE HELPERS
+# ============================================================
+
+def closes(candles):
+    return [candle["close"] for candle in candles]
+
+
+def completed_daily(candles):
+    if len(candles) < 2:
+        return []
+    return candles[:-1]
+
+
+def completed_intraday(candles):
+    if len(candles) < 2:
+        return []
+    return candles[:-1]
+
+# ============================================================
+# SWING DETECTION
+# ============================================================
+
+def is_swing_high(values, index, strength=2):
+    if index < strength:
+        return False
+    if index + strength >= len(values):
+        return False
+
+    current = values[index]
+
+    for i in range(1, strength + 1):
+        if current <= values[index - i]:
+            return False
+        if current <= values[index + i]:
+            return False
+
+    return True
+
+
+def is_swing_low(values, index, strength=2):
+    if index < strength:
+        return False
+    if index + strength >= len(values):
+        return False
+
+    current = values[index]
+
+    for i in range(1, strength + 1):
+        if current >= values[index - i]:
+            return False
+        if current >= values[index + i]:
+            return False
+
+    return True
+
+
+def get_swing_highs(candles, end_index=None):
+    values = closes(candles)
+
+    if end_index is None:
+        end_index = len(values) - 1
+
+    end_index = min(
+        end_index,
+        len(values) - 1,
+    )
+
+    result = []
+
+    for i in range(2, end_index + 1):
+        if is_swing_high(values, i):
+            result.append((i, values[i]))
+
+    return result
+
+
+def get_swing_lows(candles, end_index=None):
+    values = closes(candles)
+
+    if end_index is None:
+        end_index = len(values) - 1
+
+    end_index = min(
+        end_index,
+        len(values) - 1,
+    )
+
+    result = []
+
+    for i in range(2, end_index + 1):
+        if is_swing_low(values, i):
+            result.append((i, values[i]))
+
+    return result
+
+# ============================================================
+# DAILY BOS
+# ============================================================
+
+def detect_daily_bos_before_index(candles, end_index):
+    if end_index < 4:
+        return None
+
+    values = closes(candles)
+
+    highs = get_swing_highs(
+        candles[:end_index]
+    )
+
+    lows = get_swing_lows(
+        candles[:end_index]
+    )
+
+    candidates = []
+
+    for i in range(1, end_index):
+        previous_highs = [
+            (idx, level)
+            for idx, level in highs
+            if idx < i
+        ]
+
+        if previous_highs:
+            _, level = previous_highs[-1]
+
+            if values[i] > level:
+                candidates.append({
+                    "index": i,
+                    "datetime": candles[i]["datetime"],
+                    "level": level,
+                    "type": "Bullish BOS",
+                })
+
+        previous_lows = [
+            (idx, level)
+            for idx, level in lows
+            if idx < i
+        ]
+
+        if previous_lows:
+            _, level = previous_lows[-1]
+
+            if values[i] < level:
+                candidates.append({
+                    "index": i,
+                    "datetime": candles[i]["datetime"],
+                    "level": level,
+                    "type": "Bearish BOS",
+                })
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda x: x["index"],
+    )
+
+# ============================================================
+# SLK KEY-LEVEL DETECTION
+# ============================================================
+# Important: a key level is NOT a rejection by itself.
+# We return candidate levels first, then confirm the actual
+# rejection candle separately.
+
+
+def _body_direction(candle):
+    if candle["close"] > candle["open"]:
+        return "BUY"
+    if candle["close"] < candle["open"]:
+        return "SELL"
+    return None
+
+
+def detect_a_shape(candles):
+    """Bearish A-shape: bullish candle followed by bearish candle.
+    The key level is the shared turning area around the first candle's
+    high/body boundary, represented here by the first candle high.
+    """
+    candidates = []
+    for i in range(1, len(candles)):
+        prev = candles[i - 1]
+        cur = candles[i]
+        if _body_direction(prev) == "BUY" and _body_direction(cur) == "SELL":
+            candidates.append({
+                "pattern": "A-shape",
+                "level": prev["high"],
+                "index": i,
+                "direction": "SELL",
+            })
+    return candidates
+
+
+def detect_v_shape(candles):
+    """Bullish V-shape: bearish candle followed by bullish candle."""
+    candidates = []
+    for i in range(1, len(candles)):
+        prev = candles[i - 1]
+        cur = candles[i]
+        if _body_direction(prev) == "SELL" and _body_direction(cur) == "BUY":
+            candidates.append({
+                "pattern": "V-shape",
+                "level": prev["low"],
+                "index": i,
+                "direction": "BUY",
+            })
+    return candidates
+
+
+def detect_rbs_sbr(candles):
+    """Return only completed RBS/SBR structures.
+
+    RBS: a resistance level is closed above, then later retested and
+    respected as support.
+    SBR: a support level is closed below, then later retested and
+    respected as resistance.
+    """
+    candidates = []
+
+    # Build base levels from completed A/V-type turning points.
+    base_levels = []
+    for item in detect_a_shape(candles):
+        base_levels.append({
+            "level": item["level"],
+            "base_index": item["index"],
+            "base_direction": "SELL",
+        })
+    for item in detect_v_shape(candles):
+        base_levels.append({
+            "level": item["level"],
+            "base_index": item["index"],
+            "base_direction": "BUY",
+        })
+
+    for base in base_levels:
+        level = base["level"]
+        base_index = base["base_index"]
+
+        # RBS: close above level, then a later candle actually touches
+        # the level and closes above it.
+        for break_index in range(base_index + 1, len(candles)):
+            if candles[break_index]["close"] <= level:
+                continue
+            for retest_index in range(break_index + 1, len(candles)):
+                c = candles[retest_index]
+                touched = c["low"] <= level <= c["high"]
+                if touched and c["close"] > level:
+                    candidates.append({
+                        "pattern": "RBS",
+                        "level": level,
+                        "index": retest_index,
+                        "direction": "BUY",
+                    })
+                    break
+                # If price closes back below before a valid retest,
+                # this particular break has failed.
+                if c["close"] < level:
+                    break
+
+        # SBR: close below level, then later touch it and close below it.
+        for break_index in range(base_index + 1, len(candles)):
+            if candles[break_index]["close"] >= level:
+                continue
+            for retest_index in range(break_index + 1, len(candles)):
+                c = candles[retest_index]
+                touched = c["low"] <= level <= c["high"]
+                if touched and c["close"] < level:
+                    candidates.append({
+                        "pattern": "SBR",
+                        "level": level,
+                        "index": retest_index,
+                        "direction": "SELL",
+                    })
+                    break
+                if c["close"] > level:
+                    break
+
+    # Deduplicate identical structures.
+    unique = {}
+    for item in candidates:
+        key = (
+            item["pattern"],
+            round(item["level"], 8),
+            item["index"],
+            item["direction"],
+        )
+        unique[key] = item
+    return list(unique.values())
+
+
+def detect_ocl(candles):
+    """OCL candidates from two consecutive same-direction candles.
+    The open of the first candle is the OCL reference level.
+    Rejection is confirmed later; this function does not call a touch
+    by itself a rejection.
+    """
+    candidates = []
+    for i in range(1, len(candles)):
+        previous = candles[i - 1]
+        current = candles[i]
+        previous_direction = _body_direction(previous)
+        current_direction = _body_direction(current)
+
+        if previous_direction == "BUY" and current_direction == "BUY":
+            candidates.append({
+                "pattern": "OCL",
+                "level": previous["open"],
+                "index": i,
+                "direction": "BUY",
+            })
+        elif previous_direction == "SELL" and current_direction == "SELL":
+            candidates.append({
+                "pattern": "OCL",
+                "level": previous["open"],
+                "index": i,
+                "direction": "SELL",
+            })
+    return candidates
+
+
+def detect_qmr(candles):
+    """Quasimodo candidates.
+
+    Bearish: left-shoulder high -> higher head -> break of neckline ->
+    lower right shoulder. The QM level is the LEFT SHOULDER HIGH.
+
+    Bullish: left-shoulder low -> lower head -> break of neckline ->
+    higher right shoulder. The QM level is the LEFT SHOULDER LOW.
+    """
+    candidates = []
+    highs = get_swing_highs(candles)
+    lows = get_swing_lows(candles)
+
+    # Bearish QMR.
+    for a in range(len(highs) - 1):
+        ls_i, ls_high = highs[a]
+        head_i, head_high = highs[a + 1]
+        if head_i <= ls_i or head_high <= ls_high:
+            continue
+
+        middle_lows = [x for x in lows if ls_i < x[0] < head_i]
+        if not middle_lows:
+            continue
+        neckline = middle_lows[-1][1]
+
+        for rs_i, rs_high in highs:
+            if rs_i <= head_i or rs_high >= head_high:
+                continue
+            if not any(rs_i < x[0] for x in lows):
+                continue
+            break_index = None
+            for i in range(rs_i + 1, len(candles)):
+                if candles[i]["close"] < neckline:
+                    break_index = i
+                    break
+            if break_index is not None:
+                candidates.append({
+                    "pattern": "QMR",
+                    "level": ls_high,
+                    "index": break_index,
+                    "direction": "SELL",
+                })
+
+    # Bullish QMR.
+    for a in range(len(lows) - 1):
+        ls_i, ls_low = lows[a]
+        head_i, head_low = lows[a + 1]
+        if head_i <= ls_i or head_low >= ls_low:
+            continue
+
+        middle_highs = [x for x in highs if ls_i < x[0] < head_i]
+        if not middle_highs:
+            continue
+        neckline = middle_highs[-1][1]
+
+        for rs_i, rs_low in lows:
+            if rs_i <= head_i or rs_low <= head_low:
+                continue
+            if not any(rs_i < x[0] for x in highs):
+                continue
+            break_index = None
+            for i in range(rs_i + 1, len(candles)):
+                if candles[i]["close"] > neckline:
+                    break_index = i
+                    break
+            if break_index is not None:
+                candidates.append({
+                    "pattern": "QMR",
+                    "level": ls_low,
+                    "index": break_index,
+                    "direction": "BUY",
+                })
+
+    return candidates
+
+
+def find_key_levels(candles):
+    detectors = [
+        detect_qmr,
+        detect_rbs_sbr,
+        detect_a_shape,
+        detect_v_shape,
+        detect_ocl,
+    ]
+    candidates = []
+    for detector in detectors:
+        try:
+            result = detector(candles)
+            if result:
+                if isinstance(result, dict):
+                    result = [result]
+                candidates.extend(result)
+        except Exception as e:
+            print(f"Key-level detector error {detector.__name__}: {e}")
+
+    unique = {}
+    for item in candidates:
+        key = (
+            item["pattern"],
+            round(item["level"], 8),
+            item["index"],
+            item["direction"],
+        )
+        unique[key] = item
+    return list(unique.values())
+
+
+def find_key_level(candles):
+    """Compatibility helper: latest candidate only.
+    Daily setup uses find_key_levels() and validates rejection first.
+    """
+    candidates = find_key_levels(candles)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: x["index"])
+
+
+# ============================================================
+# STRICT HTF REJECTION
+# ============================================================
+
+def confirm_daily_rejection(candle, key_level):
+    level = key_level["level"]
+    direction = key_level["direction"]
+
+    touched = candle["low"] <= level <= candle["high"]
+    if not touched:
+        return None
+
+    close = candle["close"]
+
+    # BUY rejection: price trades at/below the level and finishes above it.
+    # SELL rejection: price trades at/above the level and finishes below it.
+    if direction == "BUY":
+        if candle["low"] <= level and close > level:
+            return {
+                "bias": "BUY",
+                "rejection": "Bullish rejection",
+                "close": close,
+            }
+
+    if direction == "SELL":
+        if candle["high"] >= level and close < level:
+            return {
+                "bias": "SELL",
+                "rejection": "Bearish rejection",
+                "close": close,
+            }
+
+    return None
+
+
+# ============================================================
+# DAILY SETUP
+# ============================================================
+
+def find_daily_setup(candles):
+    completed = completed_daily(candles)
+    if len(completed) < 20:
+        return None
+
+    # Work from the newest completed candle backwards. A setup only exists
+    # when the rejection candle itself validates a previously formed key
+    # level. A later breakout cannot manufacture a rejection retroactively.
+    for rejection_index in range(len(completed) - 1, 5, -1):
+        rejection_candle = completed[rejection_index]
+        history = completed[:rejection_index]
+        candidates = find_key_levels(history)
+        if not candidates:
+            continue
+
+        valid = []
+        for key_level in candidates:
+            if key_level["index"] >= rejection_index:
+                continue
+            rejection = confirm_daily_rejection(
+                rejection_candle,
+                key_level,
+            )
+            if not rejection:
+                continue
+            valid.append((key_level, rejection))
+
+        if not valid:
+            continue
+
+        # If several levels were touched by the same candle, use the
+        # most recently formed level. Crucially, the level MUST have passed
+        # the rejection test above.
+        key_level, daily_rejection = max(
+            valid,
+            key=lambda pair: pair[0]["index"],
+        )
+
+        # Trend/BRS must already agree with the rejection direction BEFORE
+        # the key level was formed. A simple later breakout is not enough.
+        prior_bos = detect_daily_bos_before_index(
+            completed,
+            key_level["index"],
+        )
+        if not prior_bos:
+            continue
+
+        if (
+            daily_rejection["bias"] == "BUY"
+            and prior_bos["type"] != "Bullish BOS"
+        ):
+            continue
+
+        if (
+            daily_rejection["bias"] == "SELL"
+            and prior_bos["type"] != "Bearish BOS"
+        ):
+            continue
+
+        return {
+            "rejection_index": rejection_index,
+            "rejection_datetime": rejection_candle["datetime"],
+            "key_level": key_level["level"],
+            "pattern": key_level["pattern"],
+            "daily_bias": daily_rejection["bias"],
+            "rejection": daily_rejection["rejection"],
+            "close": daily_rejection["close"],
+            "prior_bos": prior_bos,
+        }
+
+    return None
+
+# ============================================================
+# SETUP ID
+# ============================================================
+
+def setup_key(setup):
+    return (
+        f"{setup['rejection_datetime']}|"
+        f"{setup['pattern']}|"
+        f"{setup['key_level']}|"
+        f"{setup['daily_bias']}"
+    )
+
+# ============================================================
+# DAILY INVALIDATION
+# ============================================================
+
+def daily_invalidated(candles, setup):
+    completed = completed_daily(candles)
+
+    start = setup["rejection_index"] + 1
+
+    for candle in completed[start:]:
+        close = candle["close"]
+
+        if (
+            setup["daily_bias"] == "BUY"
+            and close < setup["key_level"]
+        ):
+            return True
+
+        if (
+            setup["daily_bias"] == "SELL"
+            and close > setup["key_level"]
+        ):
+            return True
+
+    return False
+
+# ============================================================
+# H4 SWEEP
+# ============================================================
+
+def find_h4_sweep(candles, bias, after_datetime):
+    if len(candles) < 5:
+        return None
+
+    completed = completed_intraday(candles)
+
+    after_dt = parse_dt(after_datetime)
+
+    if not after_dt:
+        return None
+
+    values = closes(completed)
+
+    if bias == "BUY":
+        swings = get_swing_lows(completed)
+
+        for i in range(len(completed)):
+            candle_dt = parse_dt(
+                completed[i]["datetime"]
+            )
+
+            if (
+                not candle_dt
+                or candle_dt <= after_dt
+            ):
+                continue
+
+            previous = [
+                (index, level)
+                for index, level in swings
+                if index < i
+            ]
+
+            if not previous:
+                continue
+
+            _, level = previous[-1]
+
+            if values[i] < level:
+                return {
+                    "index": i,
+                    "datetime":
+                        completed[i]["datetime"],
+                    "level": level,
+                }
+
+    else:
+        swings = get_swing_highs(completed)
+
+        for i in range(len(completed)):
+            candle_dt = parse_dt(
+                completed[i]["datetime"]
+            )
+
+            if (
+                not candle_dt
+                or candle_dt <= after_dt
+            ):
+                continue
+
+            previous = [
+                (index, level)
+                for index, level in swings
+                if index < i
+            ]
+
+            if not previous:
+                continue
+
+            _, level = previous[-1]
+
+            if values[i] > level:
+                return {
+                    "index": i,
+                    "datetime":
+                        completed[i]["datetime"],
+                    "level": level,
+                }
+
+    return None
+
+# ============================================================
+# H4 BREAKOUT
+# ============================================================
+
+def find_h4_breakout_after_sweep(
+    candles,
+    bias,
+    sweep_index,
+):
+    if len(candles) < 5:
+        return None
+
+    completed = completed_intraday(candles)
+
+    if (
+        sweep_index is None
+        or sweep_index >= len(completed) - 1
+    ):
+        return None
+
+    values = closes(completed)
+
+    if bias == "BUY":
+        highs = get_swing_highs(completed)
+
+        for i in range(
+            sweep_index + 1,
+            len(completed),
+        ):
+            previous = [
+                (index, level)
+                for index, level in highs
+                if sweep_index < index < i
+            ]
+
+            if not previous:
+                continue
+
+            _, level = previous[-1]
+
+            if values[i] > level:
+                return {
+                    "index": i,
+                    "datetime":
+                        completed[i]["datetime"],
+                    "level": level,
+                }
+
+    else:
+        lows = get_swing_lows(completed)
+
+        for i in range(
+            sweep_index + 1,
+            len(completed),
+        ):
+            previous = [
+                (index, level)
+                for index, level in lows
+                if sweep_index < index < i
+            ]
+
+            if not previous:
+                continue
+
+            _, level = previous[-1]
+
+            if values[i] < level:
+                return {
+                    "index": i,
+                    "datetime":
+                        completed[i]["datetime"],
+                    "level": level,
+                }
+
+    return None
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        print("Telegram credentials missing.")
+        return False
+
+    data = urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+    }).encode()
+
+    request = Request(
+        (
+            "https://api.telegram.org/"
+            f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        ),
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type":
+                "application/x-www-form-urlencoded"
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(
+                response.read().decode()
+            )
+            return bool(result.get("ok"))
+
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return False
+
+# ============================================================
+# ALERT MESSAGE
+# ============================================================
+
+def make_alert(
+    symbol,
+    setup,
+    sweep,
+    breakout,
+):
+    return (
+        "📊 SLK BIAS ALERT\n\n"
+        f"Symbol: {symbol}\n"
+        f"Pattern: {setup['pattern']}\n"
+        f"Key Level: {setup['key_level']}\n"
+        f"Rejection: {setup['rejection']}\n"
+        f"Close: {setup['close']}\n"
+        f"Daily Bias: {setup['daily_bias']}\n"
+        f"H4 Confirmation: "
+        f"{setup['daily_bias']} Sweep + Breakout\n"
+        f"Daily Rejection Candle: "
+        f"{setup['rejection_datetime']}\n"
+        f"H4 Sweep Candle: {sweep['datetime']}\n"
+        f"H4 Breakout Candle: {breakout['datetime']}\n\n"
+        "Reason: Daily directional BOS + "
+        "key-level rejection + H4 liquidity "
+        "sweep followed by H4 breakout."
+    )
+
+# ============================================================
+# DAILY SCAN
+# ============================================================
+
+def scan_daily_setups():
+    global LAST_DAILY_CLOCK
+
+    clock = get_time_series(
+        DAILY_CLOCK_SYMBOL,
+        "1day",
+        3,
+    )
+
+    completed = completed_daily(clock)
+
+    if not completed:
+        print("Could not read Daily clock.")
+        return False
+
+    latest_clock = completed[-1]["datetime"]
+
+    if LAST_DAILY_CLOCK == latest_clock:
+        return False
+
+    LAST_DAILY_CLOCK = latest_clock
+
+    print(
+        "New completed Daily candle: "
+        f"{latest_clock}"
+    )
+
+    for item in INSTRUMENTS:
+        symbol = resolve_symbol(item)
+
+        if not symbol:
+            continue
+
+        candles = get_time_series(
+            symbol,
+            "1day",
+            200,
+        )
+
+        if not candles:
+            continue
+
+        setup = find_daily_setup(candles)
+
+        if not setup:
+            continue
+
+        key = setup_key(setup)
+
+        if key in ALERTED_SETUPS:
+            continue
+
+        setup["symbol"] = symbol
+        setup["name"] = item["name"]
+        setup["h4_sweep"] = None
+        setup["last_h4_candle"] = None
+        setup["created_at"] = time.time()
+
+        ACTIVE_SETUPS[item["name"]] = setup
+
+        print(
+            "ACTIVE SETUP: "
+            f"{item['name']} | "
+            f"{setup['daily_bias']} | "
+            f"{setup['pattern']}"
+        )
+
+    return True
+
+# ============================================================
+# H4 CLOCK
+# ============================================================
+
+def get_latest_completed_h4_clock():
+    clock = get_time_series(
+        H4_CLOCK_SYMBOL,
+        "4h",
+        3,
+    )
+
+    completed = completed_intraday(clock)
+
+    if not completed:
+        return None
+
+    return completed[-1]["datetime"]
+
+# ============================================================
+# H4 ACTIVE-SETUP MONITOR
+# ============================================================
+
+def monitor_active_setups():
+    if not ACTIVE_SETUPS:
+        return
+
+    # One H4 clock request determines whether a new H4 candle
+    # is available. We do NOT fetch H4 for every active setup
+    # on every 5-minute loop.
+    latest_h4_clock = get_latest_completed_h4_clock()
+
+    if not latest_h4_clock:
+        print("Could not read H4 clock.")
+        return
+
+    global LAST_H4_CLOCK
+
+    if LAST_H4_CLOCK == latest_h4_clock:
+        return
+
+    LAST_H4_CLOCK = latest_h4_clock
+
+    print(
+        "New completed H4 candle: "
+        f"{latest_h4_clock}"
+    )
+
+    for name in list(ACTIVE_SETUPS.keys()):
+        setup = ACTIVE_SETUPS.get(name)
+
+        if not setup:
+            continue
+
+        symbol = setup["symbol"]
+
+        h4 = get_time_series(
+            symbol,
+            "4h",
+            120,
+        )
+
+        if not h4:
+            continue
+
+        if setup.get("h4_sweep") is None:
+            sweep = find_h4_sweep(
+                h4,
+                setup["daily_bias"],
+                setup["rejection_datetime"],
+            )
+
+            if sweep:
+                setup["h4_sweep"] = sweep
+
+                print(
+                    "H4 SWEEP FOUND: "
+                    f"{name} | "
+                    f"{sweep['datetime']}"
+                )
+
+        if setup.get("h4_sweep"):
+            breakout = find_h4_breakout_after_sweep(
+                h4,
+                setup["daily_bias"],
+                setup["h4_sweep"]["index"],
+            )
+
+            if not breakout:
+                continue
+
+            key = setup_key(setup)
+
+            if key in ALERTED_SETUPS:
+                continue
+
+            message = make_alert(
+                name,
+                setup,
+                setup["h4_sweep"],
+                breakout,
+            )
+
+            sent = send_telegram(message)
+
+            if sent:
+                ALERTED_SETUPS.add(key)
+                ACTIVE_SETUPS.pop(name, None)
+
+                print(
+                    "ALERT SENT: "
+                    f"{name}"
+                )
+
+# ============================================================
+# SCANNER LOOP
+# ============================================================
+
+def scanner_loop():
+    global INSTRUMENTS
+
+    if not TWELVE_DATA_API_KEY:
+        print("TWELVE_DATA_API_KEY is missing.")
+        return
+
+    print("Building instrument list...")
+
+    INSTRUMENTS = build_instrument_list()
+
+    print(
+        f"Loaded {len(INSTRUMENTS)} instruments."
+    )
+
+    while True:
+        try:
+            new_daily = scan_daily_setups()
+
+            # H4 is checked only when a new H4 candle has closed.
+            # No repeated H4 polling of every active setup.
+            if ACTIVE_SETUPS:
+                monitor_active_setups()
+            elif not new_daily:
+                print(
+                    "No active setups. "
+                    "Waiting for next Daily/H4 candle."
+                )
+
+        except Exception as e:
+            print(f"Scanner error: {e}")
+
+        time.sleep(CHECK_INTERVAL)
 
 # ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
+        response = {
+            "status": "running",
+            "service": "SLK Bias Trading Bot",
+        }
 
-        body = json.dumps({
-            "status": "ok",
-            "bot": "SLK Bias Trading Bot",
-            "instruments": len(INSTRUMENTS),
-            "last_scan": last_scan_time
-        }).encode("utf-8")
+        body = json.dumps(response).encode()
 
         self.send_response(200)
 
         self.send_header(
             "Content-Type",
-            "application/json"
+            "application/json",
         )
 
         self.send_header(
             "Content-Length",
-            str(len(body))
+            str(len(body)),
         )
 
         self.end_headers()
@@ -138,11 +1382,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_server():
-
+def start_health_server():
     server = HTTPServer(
         ("0.0.0.0", PORT),
-        HealthHandler
+        HealthHandler,
     )
 
     print(
@@ -151,1477 +1394,28 @@ def start_server():
 
     server.serve_forever()
 
-
 # ============================================================
-# HELPERS
+# START
 # ============================================================
-
-def safe_float(value):
-
-    try:
-        return float(value)
-
-    except Exception:
-        return None
-
-
-def format_price(value):
-
-    if value is None:
-        return "N/A"
-
-    if abs(value) >= 1000:
-        return f"{value:.2f}"
-
-    if abs(value) >= 100:
-        return f"{value:.2f}"
-
-    if abs(value) >= 10:
-        return f"{value:.3f}"
-
-    return f"{value:.5f}"
-
-
-def sort_candles(candles):
-
-    return sorted(
-        candles,
-        key=lambda x: x["datetime"]
-    )
-
-
-def remove_current_candle(candles):
-
-    if len(candles) <= 2:
-        return candles
-
-    return candles[:-1]
-
-
-# ============================================================
-# TWELVE DATA API
-# ============================================================
-
-def api_get(endpoint, params):
-
-    global last_api_call
-
-    # --------------------------------------------------------
-    # RATE LIMITER
-    # Maximum approximately 6-7 requests/minute.
-    # --------------------------------------------------------
-
-    with api_lock:
-
-        now = time.time()
-
-        wait_time = (
-            API_DELAY
-            - (now - last_api_call)
-        )
-
-        if wait_time > 0:
-
-            print(
-                f"API limiter: waiting "
-                f"{wait_time:.1f}s"
-            )
-
-            time.sleep(
-                wait_time
-            )
-
-        last_api_call = time.time()
-
-    params = dict(params)
-
-    params["apikey"] = (
-        TWELVE_DATA_API_KEY
-    )
-
-    # Explicit UTC timestamps.
-    params["timezone"] = "UTC"
-
-    url = (
-        "https://api.twelvedata.com"
-        + endpoint
-        + "?"
-        + urllib.parse.urlencode(params)
-    )
-
-    try:
-
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent":
-                "SLK-Bias-Trading-Bot/1.0"
-            }
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=30
-        ) as response:
-
-            return json.loads(
-                response.read().decode(
-                    "utf-8"
-                )
-            )
-
-    except Exception as error:
-
-        print(
-            f"API error: {error}"
-        )
-
-        return None
-
-
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
-def get_candles(
-    symbol,
-    interval,
-    outputsize=180
-):
-
-    key = (
-        symbol,
-        interval
-    )
-
-    cached = cache.get(key)
-
-    if cached:
-
-        cached_time, candles = cached
-
-        # Do not repeatedly request unchanged data.
-        if (
-            time.time()
-            - cached_time
-            < 300
-        ):
-
-            return candles
-
-    result = api_get(
-        "/time_series",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize,
-            "order": "asc"
-        }
-    )
-
-    if not result:
-        return []
-
-    if result.get("status") != "ok":
-
-        print(
-            f"{symbol} {interval}: "
-            f"{result.get('message', 'API error')}"
-        )
-
-        return []
-
-    values = result.get(
-        "values",
-        []
-    )
-
-    candles = []
-
-    for item in values:
-
-        candle = {
-            "datetime":
-                item.get("datetime"),
-
-            "open":
-                safe_float(
-                    item.get("open")
-                ),
-
-            "high":
-                safe_float(
-                    item.get("high")
-                ),
-
-            "low":
-                safe_float(
-                    item.get("low")
-                ),
-
-            "close":
-                safe_float(
-                    item.get("close")
-                )
-        }
-
-        if (
-            candle["datetime"]
-            and candle["close"] is not None
-        ):
-
-            candles.append(candle)
-
-    candles = sort_candles(
-        candles
-    )
-
-    cache[key] = (
-        time.time(),
-        candles
-    )
-
-    return candles
-
-
-# ============================================================
-# LINE-CHART STRUCTURE
-# ============================================================
-
-def is_pivot_high(
-    candles,
-    index
-):
-
-    s = PIVOT_STRENGTH
-
-    if (
-        index < s
-        or index + s >= len(candles)
-    ):
-        return False
-
-    price = candles[index]["close"]
-
-    for i in range(
-        index - s,
-        index + s + 1
-    ):
-
-        if i == index:
-            continue
-
-        if candles[i]["close"] >= price:
-            return False
-
-    return True
-
-
-def is_pivot_low(
-    candles,
-    index
-):
-
-    s = PIVOT_STRENGTH
-
-    if (
-        index < s
-        or index + s >= len(candles)
-    ):
-        return False
-
-    price = candles[index]["close"]
-
-    for i in range(
-        index - s,
-        index + s + 1
-    ):
-
-        if i == index:
-            continue
-
-        if candles[i]["close"] <= price:
-            return False
-
-    return True
-
-
-def get_pivots(candles):
-
-    highs = []
-    lows = []
-
-    for i in range(
-        PIVOT_STRENGTH,
-        len(candles)
-        - PIVOT_STRENGTH
-    ):
-
-        if is_pivot_high(
-            candles,
-            i
-        ):
-
-            highs.append({
-                "index": i,
-                "price":
-                    candles[i]["close"],
-                "time":
-                    candles[i]["datetime"]
-            })
-
-        if is_pivot_low(
-            candles,
-            i
-        ):
-
-            lows.append({
-                "index": i,
-                "price":
-                    candles[i]["close"],
-                "time":
-                    candles[i]["datetime"]
-            })
-
-    return highs, lows
-
-
-# ============================================================
-# BRS
-# ============================================================
-
-def find_latest_brs(candles):
-
-    highs, lows = get_pivots(
-        candles
-    )
-
-    events = []
-
-    for pivot in highs:
-
-        for i in range(
-            pivot["index"] + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["close"]
-                > pivot["price"]
-            ):
-
-                events.append({
-                    "direction": "BUY",
-                    "index": i,
-                    "time":
-                        candles[i]["datetime"],
-                    "level":
-                        pivot["price"],
-                    "pivot_time":
-                        pivot["time"],
-                    "type":
-                        "Bullish BRS"
-                })
-
-                break
-
-    for pivot in lows:
-
-        for i in range(
-            pivot["index"] + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["close"]
-                < pivot["price"]
-            ):
-
-                events.append({
-                    "direction": "SELL",
-                    "index": i,
-                    "time":
-                        candles[i]["datetime"],
-                    "level":
-                        pivot["price"],
-                    "pivot_time":
-                        pivot["time"],
-                    "type":
-                        "Bearish BRS"
-                })
-
-                break
-
-    if not events:
-        return None
-
-    events.sort(
-        key=lambda x: x["index"]
-    )
-
-    return events[-1]
-
-
-# ============================================================
-# KEY LEVELS
-# ============================================================
-
-def near_level(
-    price,
-    level
-):
-
-    if not price:
-        return False
-
-    return (
-        abs(price - level)
-        / abs(price)
-        <= LEVEL_TOLERANCE
-    )
-
-
-def find_support_resistance(
-    candles
-):
-
-    highs, lows = get_pivots(
-        candles
-    )
-
-    levels = []
-
-    for pivot in highs[-15:]:
-
-        levels.append({
-            "type": "Resistance",
-            "level":
-                pivot["price"],
-            "time":
-                pivot["time"]
-        })
-
-    for pivot in lows[-15:]:
-
-        levels.append({
-            "type": "Support",
-            "level":
-                pivot["price"],
-            "time":
-                pivot["time"]
-        })
-
-    return levels
-
-
-def find_ocl(candles):
-
-    levels = []
-
-    start = max(
-        1,
-        len(candles)
-        - KEY_LOOKBACK
-    )
-
-    for i in range(
-        start,
-        len(candles)
-    ):
-
-        a = candles[i - 1]
-        b = candles[i]
-
-        bullish = (
-            a["close"] > a["open"]
-            and b["close"] > b["open"]
-        )
-
-        bearish = (
-            a["close"] < a["open"]
-            and b["close"] < b["open"]
-        )
-
-        if bullish or bearish:
-
-            level = (
-                a["open"]
-                + a["close"]
-            ) / 2
-
-            levels.append({
-                "type": "OCL",
-                "level": level,
-                "time":
-                    a["datetime"]
-            })
-
-    return levels
-
-
-def find_rbs_sbr(candles):
-
-    highs, lows = get_pivots(
-        candles
-    )
-
-    levels = []
-
-    # RBS
-    for pivot in highs[-12:]:
-
-        level = pivot["price"]
-
-        broken_at = None
-
-        for i in range(
-            pivot["index"] + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["close"]
-                > level
-            ):
-
-                broken_at = i
-                break
-
-        if broken_at is None:
-            continue
-
-        for i in range(
-            broken_at + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["low"] <= level
-                and candles[i]["close"] > level
-            ):
-
-                levels.append({
-                    "type": "RBS",
-                    "level": level,
-                    "time":
-                        candles[i]["datetime"]
-                })
-
-                break
-
-    # SBR
-    for pivot in lows[-12:]:
-
-        level = pivot["price"]
-
-        broken_at = None
-
-        for i in range(
-            pivot["index"] + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["close"]
-                < level
-            ):
-
-                broken_at = i
-                break
-
-        if broken_at is None:
-            continue
-
-        for i in range(
-            broken_at + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["high"] >= level
-                and candles[i]["close"] < level
-            ):
-
-                levels.append({
-                    "type": "SBR",
-                    "level": level,
-                    "time":
-                        candles[i]["datetime"]
-                })
-
-                break
-
-    return levels
-
-
-# ============================================================
-# QMR
-# ============================================================
-
-def find_qmr(candles):
-
-    highs, lows = get_pivots(
-        candles
-    )
-
-    levels = []
-
-    # Bearish QMR
-    for i in range(
-        len(highs) - 2
-    ):
-
-        left = highs[i]
-        head = highs[i + 1]
-        right = highs[i + 2]
-
-        if not (
-            left["index"]
-            < head["index"]
-            < right["index"]
-        ):
-            continue
-
-        if (
-            head["price"]
-            <= left["price"]
-        ):
-            continue
-
-        between = [
-            x for x in lows
-            if (
-                left["index"]
-                < x["index"]
-                < head["index"]
-            )
-        ]
-
-        if not between:
-            continue
-
-        neckline = between[-1]
-
-        broken = False
-
-        for j in range(
-            head["index"] + 1,
-            right["index"] + 1
-        ):
-
-            if (
-                candles[j]["close"]
-                < neckline["price"]
-            ):
-
-                broken = True
-                break
-
-        if not broken:
-            continue
-
-        if (
-            right["price"]
-            >= head["price"]
-        ):
-            continue
-
-        levels.append({
-            "type": "QMR",
-            "level":
-                left["price"],
-            "time":
-                left["time"],
-            "direction": "SELL"
-        })
-
-    # Bullish QMR
-    for i in range(
-        len(lows) - 2
-    ):
-
-        left = lows[i]
-        head = lows[i + 1]
-        right = lows[i + 2]
-
-        if not (
-            left["index"]
-            < head["index"]
-            < right["index"]
-        ):
-            continue
-
-        if (
-            head["price"]
-            >= left["price"]
-        ):
-            continue
-
-        between = [
-            x for x in highs
-            if (
-                left["index"]
-                < x["index"]
-                < head["index"]
-            )
-        ]
-
-        if not between:
-            continue
-
-        neckline = between[-1]
-
-        broken = False
-
-        for j in range(
-            head["index"] + 1,
-            right["index"] + 1
-        ):
-
-            if (
-                candles[j]["close"]
-                > neckline["price"]
-            ):
-
-                broken = True
-                break
-
-        if not broken:
-            continue
-
-        if (
-            right["price"]
-            <= head["price"]
-        ):
-            continue
-
-        levels.append({
-            "type": "QMR",
-            "level":
-                left["price"],
-            "time":
-                left["time"],
-            "direction": "BUY"
-        })
-
-    return levels
-
-
-def get_key_levels(candles):
-
-    levels = []
-
-    levels.extend(
-        find_support_resistance(
-            candles
-        )
-    )
-
-    levels.extend(
-        find_rbs_sbr(
-            candles
-        )
-    )
-
-    levels.extend(
-        find_ocl(
-            candles
-        )
-    )
-
-    levels.extend(
-        find_qmr(
-            candles
-        )
-    )
-
-    return levels
-
-
-# ============================================================
-# HTF REJECTION
-# ============================================================
-
-def is_rejection(
-    candle,
-    level,
-    direction
-):
-
-    if not (
-        candle["high"]
-        and candle["low"]
-        and candle["close"]
-    ):
-        return False
-
-    touched = (
-        candle["low"]
-        <= level
-        <= candle["high"]
-    )
-
-    if not touched:
-        return False
-
-    if direction == "BUY":
-
-        return (
-            candle["close"]
-            > level
-        )
-
-    if direction == "SELL":
-
-        return (
-            candle["close"]
-            < level
-        )
-
-    return False
-
-
-def find_htf_rejection(
-    candles,
-    brs,
-    levels
-):
-
-    direction = brs["direction"]
-
-    candidates = []
-
-    for level_data in levels:
-
-        level = level_data[
-            "level"
-        ]
-
-        level_type = level_data[
-            "type"
-        ]
-
-        if (
-            level_type == "QMR"
-            and level_data.get(
-                "direction"
-            ) != direction
-        ):
-            continue
-
-        for i in range(
-            brs["index"] + 1,
-            len(candles)
-        ):
-
-            if is_rejection(
-                candles[i],
-                level,
-                direction
-            ):
-
-                candidates.append({
-                    "direction":
-                        direction,
-
-                    "level_type":
-                        level_type,
-
-                    "level":
-                        level,
-
-                    "level_time":
-                        level_data["time"],
-
-                    "rejection_index":
-                        i,
-
-                    "rejection_time":
-                        candles[i]["datetime"],
-
-                    "close":
-                        candles[i]["close"]
-                })
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x:
-            x["rejection_index"]
-    )
-
-    return candidates[-1]
-
-
-# ============================================================
-# EXTERNAL BREAKOUT
-# ============================================================
-
-def find_external_bo(
-    candles,
-    direction,
-    rejection_time
-):
-
-    highs, lows = get_pivots(
-        candles
-    )
-
-    if direction == "BUY":
-
-        candidates = [
-            p for p in highs
-            if p["time"] > rejection_time
-        ]
-
-        if not candidates:
-            return None
-
-        external = candidates[-1]
-
-        for i in range(
-            external["index"] + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["close"]
-                > external["price"]
-            ):
-
-                return {
-                    "direction": "BUY",
-                    "level":
-                        external["price"],
-                    "pivot_time":
-                        external["time"],
-                    "break_time":
-                        candles[i]["datetime"],
-                    "close":
-                        candles[i]["close"]
-                }
-
-    if direction == "SELL":
-
-        candidates = [
-            p for p in lows
-            if p["time"] > rejection_time
-        ]
-
-        if not candidates:
-            return None
-
-        external = candidates[-1]
-
-        for i in range(
-            external["index"] + 1,
-            len(candles)
-        ):
-
-            if (
-                candles[i]["close"]
-                < external["price"]
-            ):
-
-                return {
-                    "direction": "SELL",
-                    "level":
-                        external["price"],
-                    "pivot_time":
-                        external["time"],
-                    "break_time":
-                        candles[i]["datetime"],
-                    "close":
-                        candles[i]["close"]
-                }
-
-    return None
-
-
-# ============================================================
-# BUILD BIAS
-# ============================================================
-
-def build_bias(
-    symbol,
-    htf_name,
-    htf_interval,
-    lower_name,
-    lower_interval
-):
-
-    raw_htf = get_candles(
-        symbol,
-        htf_interval,
-        180
-    )
-
-    if len(raw_htf) < MIN_BARS:
-        return None
-
-    htf = remove_current_candle(
-        raw_htf
-    )
-
-    brs = find_latest_brs(
-        htf
-    )
-
-    if not brs:
-        return None
-
-    levels = get_key_levels(
-        htf
-    )
-
-    rejection = find_htf_rejection(
-        htf,
-        brs,
-        levels
-    )
-
-    if not rejection:
-        return None
-
-    raw_lower = get_candles(
-        symbol,
-        lower_interval,
-        220
-    )
-
-    if len(raw_lower) < MIN_BARS:
-        return None
-
-    lower = remove_current_candle(
-        raw_lower
-    )
-
-    external = find_external_bo(
-        lower,
-        rejection["direction"],
-        rejection["rejection_time"]
-    )
-
-    if not external:
-        return None
-
-    return {
-        "symbol": symbol,
-
-        "bias":
-            rejection["direction"],
-
-        "htf":
-            htf_name,
-
-        "lower_tf":
-            lower_name,
-
-        "brs_type":
-            brs["type"],
-
-        "brs_level":
-            brs["level"],
-
-        "brs_time":
-            brs["time"],
-
-        "key_type":
-            rejection["level_type"],
-
-        "key_level":
-            rejection["level"],
-
-        "key_time":
-            rejection["level_time"],
-
-        "rejection_time":
-            rejection["rejection_time"],
-
-        "htf_close":
-            rejection["close"],
-
-        "external_level":
-            external["level"],
-
-        "external_pivot_time":
-            external["pivot_time"],
-
-        "external_break_time":
-            external["break_time"],
-
-        "external_close":
-            external["close"]
-    }
-
-
-# ============================================================
-# DUPLICATE PROTECTION
-# ============================================================
-
-def get_signal_id(signal):
-
-    return "|".join([
-        signal["symbol"],
-        signal["bias"],
-        signal["htf"],
-        signal["brs_time"],
-        signal["key_type"],
-        signal["rejection_time"],
-        signal["external_break_time"]
-    ])
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_BOT_TOKEN
-        + "/sendMessage"
-    )
-
-    data = urllib.parse.urlencode({
-        "chat_id":
-            TELEGRAM_CHAT_ID,
-        "text":
-            message
-    }).encode("utf-8")
-
-    try:
-
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST"
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=20
-        ) as response:
-
-            response.read()
-
-        return True
-
-    except Exception as error:
-
-        print(
-            f"Telegram error: {error}"
-        )
-
-        return False
-
-
-def make_alert(signal):
-
-    name = signal["symbol"]
-
-    direction = signal[
-        "bias"
-    ]
-
-    return (
-        f"🚨 {direction} · "
-        f"{name} · "
-        f"{signal['htf']}→"
-        f"{signal['lower_tf']}\n\n"
-
-        f"External breakout confirmed\n\n"
-
-        f"HTF BRS: "
-        f"{signal['brs_type']}\n"
-
-        f"BRS level: "
-        f"{format_price(signal['brs_level'])}\n"
-
-        f"BRS formed: "
-        f"{signal['brs_time']}\n\n"
-
-        f"Key Level: "
-        f"{signal['key_type']} @ "
-        f"{format_price(signal['key_level'])}\n"
-
-        f"Key level formed: "
-        f"{signal['key_time']}\n\n"
-
-        f"HTF rejection: "
-        f"{signal['rejection_time']}\n"
-
-        f"HTF close: "
-        f"{format_price(signal['htf_close'])}\n\n"
-
-        f"External BO: "
-        f"{signal['lower_tf']}\n"
-
-        f"Broke: "
-        f"{format_price(signal['external_level'])}\n"
-
-        f"Break confirmed: "
-        f"{signal['external_break_time']}\n"
-
-        f"Close: "
-        f"{format_price(signal['external_close'])}\n\n"
-
-        f"✅ SLK Bias Confirmed\n"
-
-        f"⚠️ Not an entry signal. "
-        f"Bias only — wait for "
-        f"your entry model."
-    )
-
-
-# ============================================================
-# SCAN
-# ============================================================
-
-def scan_instrument(
-    name,
-    symbol
-):
-
-    signals = []
-
-    print(
-        f"Checking {name} -> {symbol}"
-    )
-
-    # W1 -> D1
-    try:
-
-        signal = build_bias(
-            symbol,
-            "W1",
-            "1week",
-            "D1",
-            "1day"
-        )
-
-        if signal:
-            signals.append(
-                signal
-            )
-
-    except Exception as error:
-
-        print(
-            f"W1 error {name}: "
-            f"{error}"
-        )
-
-    # D1 -> H4
-    try:
-
-        signal = build_bias(
-            symbol,
-            "D1",
-            "1day",
-            "H4",
-            "4h"
-        )
-
-        if signal:
-            signals.append(
-                signal
-            )
-
-    except Exception as error:
-
-        print(
-            f"D1 error {name}: "
-            f"{error}"
-        )
-
-    return signals
-
-
-def scan_market():
-
-    global last_scan_time
-
-    print(
-        "\n================================"
-    )
-
-    print(
-        "STARTING SLK MARKET SCAN"
-    )
-
-    print(
-        "14 instruments"
-    )
-
-    print(
-        "Rate limit protected"
-    )
-
-    print(
-        "================================"
-    )
-
-    for name, symbol in INSTRUMENTS.items():
-
-        signals = scan_instrument(
-            name,
-            symbol
-        )
-
-        for signal in signals:
-
-            sid = get_signal_id(
-                signal
-            )
-
-            with state_lock:
-
-                if sid in sent_signals:
-
-                    print(
-                        "Duplicate signal "
-                        "ignored."
-                    )
-
-                    continue
-
-            message = make_alert(
-                signal
-            )
-
-            print(
-                "\nNEW SIGNAL\n"
-                + message
-            )
-
-            if send_telegram(
-                message
-            ):
-
-                with state_lock:
-
-                    sent_signals[
-                        sid
-                    ] = time.time()
-
-    last_scan_time = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
-    )
-
-    print(
-        "\nSCAN COMPLETED: "
-        + last_scan_time
-    )
-
-
-# ============================================================
-# LOOP
-# ============================================================
-
-def scanner_loop():
-
-    time.sleep(5)
-
-    while True:
-
-        try:
-
-            scan_market()
-
-        except Exception as error:
-
-            print(
-                f"Scanner error: "
-                f"{error}"
-            )
-
-        print(
-            f"Next scan in "
-            f"{SCAN_INTERVAL} seconds."
-        )
-
-        time.sleep(
-            SCAN_INTERVAL
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError(
-            "TWELVE_DATA_API_KEY missing."
-        )
-
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN missing."
-        )
-
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_CHAT_ID missing."
-        )
-
-    print(
-        "================================"
-    )
-
-    print(
-        "SLK BIAS TRADING BOT"
-    )
-
-    print(
-        "================================"
-    )
-
-    print(
-        "14 instruments loaded."
-    )
-
-    print(
-        "W1 -> D1 External BO"
-    )
-
-    print(
-        "D1 -> H4 External BO"
-    )
-
-    print(
-        "API rate protection ON"
-    )
-
-    print(
-        "Scan interval: "
-        f"{SCAN_INTERVAL}s"
-    )
-
-    print(
-        "================================"
-    )
-
-    Thread(
-        target=start_server,
-        daemon=True
-    ).start()
-
-    Thread(
-        target=scanner_loop,
-        daemon=True
-    ).start()
-
-    while True:
-
-        time.sleep(60)
-
 
 if __name__ == "__main__":
-    main()
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    )
+
+    health_thread.start()
+
+    scanner_thread = threading.Thread(
+        target=scanner_loop,
+        daemon=True,
+    )
+
+    scanner_thread.start()
+
+    print(
+        "SLK Bias Trading Bot is fully running."
+    )
+
+    while True:
+        time.sleep(60)
