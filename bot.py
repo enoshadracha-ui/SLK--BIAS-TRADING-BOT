@@ -9,9 +9,12 @@ from urllib.error import HTTPError, URLError
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ============================================================
-# SSLK BUYERS BUILDER v5
-# Daily structure -> key-level rejection -> H4 sweep/reclaim
-# -> H4 breakout confirmation -> Telegram alert
+# SLK BIAS BUILDER v10
+# Daily line-chart structure -> approved key-level rejection
+# -> H4 line-chart sweep/reclaim -> H4 breakout confirmation
+# -> Telegram alert
+# Approved key levels ONLY: Resistance, Support, RBS, SBR, OCL, QMR.
+# Engulfing OB / strong OB / order-block detectors are intentionally excluded.
 # ============================================================
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
@@ -41,8 +44,12 @@ INSTRUMENTS_CONFIG = [
     {"name": "EURJPY", "symbols": ["EUR/JPY", "EURJPY"]},
     {"name": "GBPJPY", "symbols": ["GBP/JPY", "GBPJPY"]},
     {"name": "AUDJPY", "symbols": ["AUD/JPY", "AUDJPY"]},
+    {"name": "JP225", "symbols": ["JP225", "NIKKEI", "NI225"]},
+    {"name": "UK100", "symbols": ["UK100", "FTSE"]},
+    {"name": "NAS100", "symbols": ["NAS100", "NDX"]},
     {"name": "XAUUSD", "symbols": ["XAU/USD", "XAUUSD"]},
 ]
+
 ACTIVE_SETUPS = {}
 ALERTED_SETUPS = set()
 RESOLVED_SYMBOLS = {}
@@ -82,7 +89,7 @@ def http_get(url, params=None):
             time.sleep(wait)
         LAST_API_REQUEST = time.monotonic()
         try:
-            req = Request(url, headers={"User-Agent": "SRK-Bias-Builder/4.0"})
+            req = Request(url, headers={"User-Agent": "SLK-Bias-Builder/9.0"})
             with urlopen(req, timeout=30) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
@@ -182,20 +189,51 @@ def detect_bos_before(candles, end_index):
     return max(candidates, key=lambda x: x["index"]) if candidates else None
 
 
-def detect_a_shape(candles):
+def detect_resistance(candles):
+    """Resistance is the bearish A-shape turning level.
+
+    A-shape is not exposed as a separate key-level type; it is labelled
+    simply as Resistance. The level is based on a confirmed line-chart
+    swing high.
+    """
     out = []
-    for i in range(1, len(candles)):
-        if body_direction(candles[i-1]) == "BUY" and body_direction(candles[i]) == "SELL":
-            out.append({"pattern": "A-shape", "level": candles[i-1]["high"], "index": i, "direction": "SELL"})
+    for event in range(len(candles)):
+        for index, level in confirmed_swings_before(candles, event, "high"):
+            out.append({
+                "pattern": "Resistance",
+                "level": level,
+                "index": index,
+                "direction": "SELL",
+            })
     return out
 
 
-def detect_v_shape(candles):
+def detect_support(candles):
+    """Support is the bullish V-shape turning level.
+
+    V-shape is not exposed as a separate key-level type; it is labelled
+    simply as Support. The level is based on a confirmed line-chart
+    swing low.
+    """
     out = []
-    for i in range(1, len(candles)):
-        if body_direction(candles[i-1]) == "SELL" and body_direction(candles[i]) == "BUY":
-            out.append({"pattern": "V-shape", "level": candles[i-1]["low"], "index": i, "direction": "BUY"})
+    for event in range(len(candles)):
+        for index, level in confirmed_swings_before(candles, event, "low"):
+            out.append({
+                "pattern": "Support",
+                "level": level,
+                "index": index,
+                "direction": "BUY",
+            })
     return out
+
+
+def turning_points_for_rbs_sbr(candles):
+    """Internal turning points for RBS/SBR.
+
+    These are deliberately internal and are not displayed as A-shape or
+    V-shape key levels. RBS is bullish and SBR is bearish.
+    """
+    return detect_resistance(candles) + detect_support(candles)
 
 
 def detect_ocl(candles):
@@ -208,8 +246,9 @@ def detect_ocl(candles):
 
 
 def detect_rbs_sbr(candles):
+    """RBS = bullish key level; SBR = bearish key level."""
     out = []
-    bases = detect_a_shape(candles) + detect_v_shape(candles)
+    bases = turning_points_for_rbs_sbr(candles)
     for base in bases:
         level, start = base["level"], base["index"]
         for b in range(start + 1, len(candles)):
@@ -232,8 +271,50 @@ def detect_rbs_sbr(candles):
     return out
 
 
+def detect_qmr(candles):
+    """Detect simple confirmed Quasimodo reference levels using the line chart.
+
+    Bearish QM: left-shoulder high -> higher head -> lower right shoulder.
+    The reference level is the left-shoulder high.
+    Bullish QM: left-shoulder low -> lower head -> higher right shoulder.
+    The reference level is the left-shoulder low.
+    """
+    out = []
+    highs = []
+    lows = []
+    for event in range(len(candles)):
+        highs = confirmed_swings_before(candles, event, "high")
+        lows = confirmed_swings_before(candles, event, "low")
+        if len(highs) >= 2:
+            ls_i, ls = highs[-2]
+            head_i, head = highs[-1]
+            if head > ls:
+                later_highs = [x for x in confirmed_swings_before(candles, len(candles), "high") if x[0] > head_i and x[1] < head]
+                if later_highs:
+                    rs_i, rs = later_highs[0]
+                    out.append({"pattern": "QMR", "level": ls, "index": rs_i, "direction": "SELL"})
+        if len(lows) >= 2:
+            ls_i, ls = lows[-2]
+            head_i, head = lows[-1]
+            if head < ls:
+                later_lows = [x for x in confirmed_swings_before(candles, len(candles), "low") if x[0] > head_i and x[1] > head]
+                if later_lows:
+                    rs_i, rs = later_lows[0]
+                    out.append({"pattern": "QMR", "level": ls, "index": rs_i, "direction": "BUY"})
+    unique = {}
+    for x in out:
+        unique[(x["pattern"], round(x["level"], 8), x["index"], x["direction"])] = x
+    return list(unique.values())
+
+
 def find_key_levels(candles):
-    items = detect_a_shape(candles) + detect_v_shape(candles) + detect_ocl(candles) + detect_rbs_sbr(candles)
+    items = (
+        detect_resistance(candles)
+        + detect_support(candles)
+        + detect_ocl(candles)
+        + detect_qmr(candles)
+        + detect_rbs_sbr(candles)
+    )
     unique = {}
     for x in items:
         unique[(x["pattern"], round(x["level"], 8), x["index"], x["direction"])] = x
@@ -336,19 +417,25 @@ def find_h4_sweep(candles, bias, after_datetime):
 
 
 def find_h4_breakout_after_sweep(candles, bias, sweep_index):
+    """After the liquidity sweep, wait for a line-chart structure break.
+
+    BUY: close above the latest confirmed H4 swing high formed after the sweep.
+    SELL: close below the latest confirmed H4 swing low formed after the sweep.
+    """
     h = completed(candles)
-    if sweep_index is None or sweep_index >= len(h)-1:
+    if sweep_index is None or sweep_index >= len(h) - 1:
         return None
-    kind = "high" if bias == "BUY" else "low"
+
     for i in range(sweep_index + 1, len(h)):
-        swings = [x for x in confirmed_swings_before(h, i, kind) if sweep_index < x[0] < i]
+        kind = "high" if bias == "BUY" else "low"
+        swings = [x for x in confirmed_swings_before(h, i, kind) if x[0] > sweep_index]
         if not swings:
             continue
         level = swings[-1][1]
         if bias == "BUY" and h[i]["close"] > level:
-            return {"index": i, "datetime": h[i]["datetime"], "level": level}
+            return {"index": i, "datetime": h[i]["datetime"], "level": level, "type": "Bullish H4 CHoCH/BOS"}
         if bias == "SELL" and h[i]["close"] < level:
-            return {"index": i, "datetime": h[i]["datetime"], "level": level}
+            return {"index": i, "datetime": h[i]["datetime"], "level": level, "type": "Bearish H4 CHoCH/BOS"}
     return None
 
 
@@ -369,16 +456,16 @@ def send_telegram(message):
 def make_alert(name, setup, sweep, breakout):
     direction = setup["daily_bias"]
     return (
-        f"📊 SRK BIAS ALERT — {direction}\n\n"
+        f"📊 SLK BIAS BUILDER ALERT — {direction}\n\n"
         f"Symbol: {name}\n"
         f"Daily pattern: {setup['pattern']}\n"
         f"Daily BOS: {setup['prior_bos']['type']}\n"
         f"Key level: {setup['key_level']}\n"
         f"Daily rejection: {setup['rejection_datetime']}\n"
         f"H4 sweep/reclaim: {sweep['datetime']}\n"
-        f"H4 breakout entry: {breakout['datetime']}\n"
+        f"H4 structure break entry: {breakout['datetime']}\n"
         f"Target level: {setup.get('target_level') or 'Not detected'}\n\n"
-        "Sequence: Daily BOS → key-level rejection → H4 liquidity sweep/reclaim → H4 breakout."
+        "Sequence: Daily line-chart CHoCH/BOS → key-level rejection → H4 sweep/reclaim → H4 line-chart CHoCH/BOS."
     )
 
 
@@ -485,7 +572,7 @@ def scanner_loop():
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({"status": "running", "service": "SRK Bias Builder v4", "active_setups": len(ACTIVE_SETUPS)}).encode()
+        body = json.dumps({"status": "running", "service": "SLK Bias Builder v7", "active_setups": len(ACTIVE_SETUPS)}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -502,6 +589,6 @@ def start_health_server():
 if __name__ == "__main__":
     threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=scanner_loop, daemon=True).start()
-    print("SRK Bias Builder v4 is running")
+    print("SLK Bias Builder v7 is running")
     while True:
         time.sleep(60)
