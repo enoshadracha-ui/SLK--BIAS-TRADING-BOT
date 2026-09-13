@@ -254,42 +254,70 @@ def normalize_symbol(symbol):
     )
 
 
+# ============================================================
+# FIXED INSTRUMENT LIST
+# ============================================================
+
 def build_instrument_list():
 
-    instruments = []
-
-    seen = set()
-
-    forex_pairs = get_forex_pairs()
-
-    for pair in forex_pairs:
-
-        name = normalize_symbol(pair)
-
-        if not name:
-            continue
-
-        if name in seen:
-            continue
-
-        instruments.append({
-            "name": name,
-            "symbols": [pair]
-        })
-
-        seen.add(name)
-
-    for name, aliases in SPECIAL_MARKETS.items():
-
-        if name in seen:
-            continue
-
-        instruments.append({
-            "name": name,
-            "symbols": aliases
-        })
-
-        seen.add(name)
+    instruments = [
+        {
+            "name": "EURUSD",
+            "symbols": ["EUR/USD", "EURUSD"]
+        },
+        {
+            "name": "GBPUSD",
+            "symbols": ["GBP/USD", "GBPUSD"]
+        },
+        {
+            "name": "USDJPY",
+            "symbols": ["USD/JPY", "USDJPY"]
+        },
+        {
+            "name": "USDCHF",
+            "symbols": ["USD/CHF", "USDCHF"]
+        },
+        {
+            "name": "AUDUSD",
+            "symbols": ["AUD/USD", "AUDUSD"]
+        },
+        {
+            "name": "USDCAD",
+            "symbols": ["USD/CAD", "USDCAD"]
+        },
+        {
+            "name": "EURGBP",
+            "symbols": ["EUR/GBP", "EURGBP"]
+        },
+        {
+            "name": "EURJPY",
+            "symbols": ["EUR/JPY", "EURJPY"]
+        },
+        {
+            "name": "GBPJPY",
+            "symbols": ["GBP/JPY", "GBPJPY"]
+        },
+        {
+            "name": "AUDJPY",
+            "symbols": ["AUD/JPY", "AUDJPY"]
+        },
+        {
+            "name": "JP225",
+            "symbols": ["JP225", "NIKKEI", "NI225"]
+        },
+        {
+            "name": "UK100",
+            "symbols": ["UK100", "FTSE"]
+        },
+        {
+            "name": "NAS100",
+            "symbols": ["NAS100", "NDX"]
+        },
+        {
+            "name": "XAUUSD",
+            "symbols": ["XAU/USD", "XAUUSD"]
+        }
+    ]
 
     return instruments
 
