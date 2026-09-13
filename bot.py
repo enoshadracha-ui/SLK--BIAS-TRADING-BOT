@@ -852,7 +852,11 @@ if __name__ == "__main__":
         target=scanner_loop,
         daemon=True
     )
+    scanner_thread.start()
 
-  
+    print("SLK Bias Trading Bot is fully running.")
+
+    while True:
+        time.sleep(60)
     
         
